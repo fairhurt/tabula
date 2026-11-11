@@ -1,0 +1,179 @@
+//! The Tabula window.
+
+mod ai_panel;
+mod connect;
+mod data;
+mod grid;
+mod query;
+mod structure;
+mod workspace;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use gpui_kit::component::{Icon, Theme, ThemeMode};
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{
+    App, AppContext as _, Bounds, HeadlessAppContext, Hsla, KeyBinding, SharedString,
+    TitlebarOptions, WindowBounds, WindowOptions, point, px, rgb, size,
+};
+
+pub use workspace::Workspace;
+
+gpui_kit::actions!(
+    tabula,
+    [
+        RunQuery,
+        NewQuery,
+        CloseTab,
+        ToggleAi,
+        AskAiInEditor,
+        Refresh,
+        NextPage,
+        PrevPage,
+        CopySelection,
+    ]
+);
+
+/// A Lucide icon by name, e.g. `icon("database")`.
+pub fn icon(name: &str) -> Icon {
+    Icon::empty().path(SharedString::from(format!("icons/{name}.svg")))
+}
+
+pub fn c(hex: u32) -> Hsla {
+    rgb(hex).into()
+}
+
+/// A key with Ctrl on Linux and Windows, Cmd on macOS.
+macro_rules! key {
+    ($k:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("cmd-", $k)
+        } else {
+            concat!("ctrl-", $k)
+        }
+    };
+}
+
+/// Theme and key bindings: everything both the window and headless
+/// screenshots need.
+fn setup(cx: &mut App, dark: bool) {
+    gpui_kit::init(cx);
+    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
+    Theme::update(cx, |t| {
+        t.font_size = px(13.);
+        t.radius = px(6.);
+        // A database-blue accent.
+        let (primary, hover) = if dark { (0x3b82f6, 0x60a5fa) } else { (0x2563eb, 0x1d4ed8) };
+        t.primary = c(primary);
+        t.primary_hover = c(hover);
+        t.primary_active = c(hover);
+        t.button_primary = c(primary);
+        t.button_primary_hover = c(hover);
+        t.button_primary_active = c(hover);
+        t.ring = c(primary);
+        t.caret = c(primary);
+        t.link = c(primary);
+    });
+    cx.bind_keys([
+        KeyBinding::new(key!("enter"), RunQuery, Some("QueryTab")),
+        KeyBinding::new("f5", RunQuery, Some("QueryTab")),
+        KeyBinding::new(key!("k"), AskAiInEditor, Some("QueryTab")),
+        KeyBinding::new(key!("t"), NewQuery, Some("Workspace")),
+        KeyBinding::new(key!("w"), CloseTab, Some("Workspace")),
+        KeyBinding::new(key!("shift-a"), ToggleAi, Some("Workspace")),
+        KeyBinding::new(key!("r"), Refresh, Some("Workspace")),
+        KeyBinding::new(key!("c"), CopySelection, Some("ResultGrid")),
+    ]);
+}
+
+pub fn run(url: Option<String>) -> anyhow::Result<()> {
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .run(move |cx: &mut App| {
+            let dark = !matches!(
+                cx.window_appearance(),
+                gpui_kit::WindowAppearance::Light | gpui_kit::WindowAppearance::VibrantLight
+            );
+            setup(cx, dark);
+            let bounds = Bounds::centered(None, size(px(1400.), px(880.)), cx);
+            let opened = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Tabula".into()),
+                        ..Default::default()
+                    }),
+                    window_min_size: Some(size(px(800.), px(500.))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Workspace::new(url.clone(), true, window, cx)),
+            );
+            if let Err(e) = opened {
+                eprintln!("couldn't open the window: {e}");
+                cx.quit();
+            }
+            cx.on_window_closed(|cx, _| cx.quit()).detach();
+            cx.activate(true);
+        });
+    Ok(())
+}
+
+/// Render the main views headless (no display needed) to PNGs, dark and
+/// light. With `url`, connect first so the views show real data.
+pub fn screenshots(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&dir)?;
+    for dark in [true, false] {
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_kit::platform::current_platform(true).text_system(),
+            Arc::new(gpui_kit::assets::AllAssets),
+            gpui_kit::platform::current_headless_renderer,
+        );
+        cx.update(|cx| setup(cx, dark));
+        let (win, ws) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: size(px(1400.), px(880.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| Workspace::new(url.clone(), false, window, cx)),
+            )
+        })?;
+        let mode = if dark { "dark" } else { "light" };
+        let settle = |cx: &mut HeadlessAppContext| -> anyhow::Result<()> {
+            // Database work runs on tokio; give it time to come back.
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cx.run_until_parked();
+                cx.update_window(win, |_, window, cx| window.render_frame(cx))?;
+            }
+            Ok(())
+        };
+        let shoot = |cx: &mut HeadlessAppContext, name: &str| -> anyhow::Result<()> {
+            let p = dir.join(format!("{name}-{mode}.png"));
+            cx.capture_screenshot(win)?.save(&p)?;
+            println!("saved {}", p.display());
+            Ok(())
+        };
+        settle(&mut cx)?;
+        shoot(&mut cx, "start")?;
+        if url.is_none() {
+            continue;
+        }
+        for step in workspace::ShotStep::ALL {
+            cx.update_window(win, |_, window, cx| {
+                ws.update(cx, |w, cx| w.shot(step, window, cx))
+            })?;
+            settle(&mut cx)?;
+            shoot(&mut cx, step.name())?;
+        }
+    }
+    Ok(())
+}
