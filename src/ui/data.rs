@@ -275,7 +275,8 @@ impl DataTab {
 
     // ---------------------------------------------------------------- edits
 
-    fn pending(&self, cx: &gpui_kit::App) -> usize {
+    /// How many row edits are staged but not saved.
+    pub fn pending(&self, cx: &gpui_kit::App) -> usize {
         self.table.read(cx).delegate().changes().len()
     }
 

@@ -160,6 +160,15 @@ enum Modal {
     Agents,
     Approve(Approval),
     History(Entity<HistoryView>),
+    /// Closing would throw away row edits that haven't been saved.
+    Discard(Discard),
+}
+
+/// What is being closed, and how many unsaved edits go with it.
+#[derive(Clone, Copy)]
+enum Discard {
+    Tab { tab: usize, edits: usize },
+    Quit { edits: usize },
 }
 
 /// Views the headless screenshots step through.
@@ -338,7 +347,8 @@ impl Workspace {
                     });
                     ws.save_settings();
                 });
-                true
+                // Don't close over unsaved row edits without asking.
+                this.update(cx, |ws, cx| ws.may_quit(cx)).unwrap_or(true)
             });
         }
         if live && ws.settings.check_for_updates && crate::update::enabled() {
@@ -876,6 +886,98 @@ impl Workspace {
         });
         self._subs.push(sub);
         self.add_tab(Tab::Erd(tab), cx);
+    }
+
+    /// Row edits staged in a tab and not saved.
+    fn unsaved_in(&self, ix: usize, cx: &gpui_kit::App) -> usize {
+        match self.tabs.get(ix) {
+            Some(Tab::Data(t)) => t.read(cx).pending(cx),
+            _ => 0,
+        }
+    }
+
+    /// Close a tab, asking first if that would lose unsaved row edits.
+    fn ask_to_close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let edits = self.unsaved_in(ix, cx);
+        if edits == 0 {
+            self.close_tab(ix, cx);
+        } else if self.modal.is_none() {
+            self.active = ix;
+            self.modal = Some(Modal::Discard(Discard::Tab { tab: ix, edits }));
+            cx.notify();
+        }
+    }
+
+    /// Whether the window may close now. If tabs hold unsaved row edits,
+    /// asks instead, and the answer closes it.
+    fn may_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        let edits: usize = (0..self.tabs.len()).map(|i| self.unsaved_in(i, cx)).sum();
+        if edits == 0 {
+            return true;
+        }
+        // Another dialog (an agent's approval, say) keeps its place.
+        if self.modal.is_none() || matches!(self.modal, Some(Modal::Agents | Modal::History(_))) {
+            self.modal = Some(Modal::Discard(Discard::Quit { edits }));
+        }
+        cx.notify();
+        false
+    }
+
+    fn render_discard(&self, what: Discard, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let (edits, title, confirm) = match what {
+            Discard::Tab { tab, edits } => {
+                let name = self.tabs.get(tab).map(|t| t.title(cx).to_string()).unwrap_or_default();
+                (edits, format!("Close {name} without saving?"), "Discard and close")
+            }
+            Discard::Quit { edits } => (edits, "Quit without saving?".to_string(), "Discard and quit"),
+        };
+        v_flex()
+            .w(super::rem(460.))
+            .p_5()
+            .gap_3()
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.warning.opacity(0.6))
+            .rounded(theme.radius_lg)
+            .shadow_lg()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(icon("pencil-line").text_color(theme.warning))
+                    .child(div().text_lg().font_semibold().child(title)),
+            )
+            .child(div().text_sm().text_color(theme.muted_foreground).child(format!(
+                "{edits} row change{} {} not been saved to the database and will be lost.",
+                if edits == 1 { "" } else { "s" },
+                if edits == 1 { "has" } else { "have" },
+            )))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("discard-keep")
+                            .small()
+                            .outline()
+                            .label("Keep editing")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(Button::new("discard-confirm").small().danger().label(confirm).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.modal = None;
+                            match what {
+                                Discard::Tab { tab, .. } => this.close_tab(tab, cx),
+                                // Past the question: quit for real.
+                                Discard::Quit { .. } => cx.quit(),
+                            }
+                        },
+                    ))),
+            )
     }
 
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -1612,7 +1714,7 @@ impl Workspace {
                             .icon(icon("x"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.close_tab(i, cx)
+                                this.ask_to_close_tab(i, cx)
                             })),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2056,6 +2158,7 @@ impl Render for Workspace {
             Modal::Agents => self.render_agents(cx).into_any_element(),
             Modal::Approve(a) => self.render_approval(a, cx).into_any_element(),
             Modal::History(h) => h.clone().into_any_element(),
+            Modal::Discard(what) => self.render_discard(*what, cx).into_any_element(),
         });
         let closable = matches!(self.modal, Some(Modal::Agents | Modal::History(_)));
         v_flex()
@@ -2067,7 +2170,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewQuery, window, cx| this.new_query(window, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
                 let i = this.active;
-                this.close_tab(i, cx)
+                this.ask_to_close_tab(i, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleAi, _, cx| {
                 this.show_ai = !this.show_ai;

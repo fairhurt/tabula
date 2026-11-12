@@ -1,4 +1,4 @@
-# Builds the Windows installer and publishes a GitHub release when a version
+# Builds the Windows installer, and publishes a GitHub release when a version
 # tag is pushed:
 #
 #   1. Set `version` in Cargo.toml (say 0.3.0) and commit.
@@ -6,11 +6,16 @@
 #
 # Tabula's own update check reads the latest release, so publishing here is
 # what makes installed copies offer the update.
+#
+# To try the build without releasing anything, run this workflow by hand
+# (Actions > Release > Run workflow). It builds the same files and attaches
+# them to the run as an artifact instead of publishing them.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,11 +30,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check the tag matches Cargo.toml
+      - name: Read the version
         shell: pwsh
         run: |
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+          # A release's tag must be the version in Cargo.toml.
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and "v$version" -ne $env:GITHUB_REF_NAME) {
             throw "The tag is $env:GITHUB_REF_NAME but Cargo.toml says $version. Bump the version, commit, and tag that commit."
           }
           "VERSION=$version" >> $env:GITHUB_ENV
@@ -56,7 +62,17 @@ jobs:
           }
           Get-ChildItem dist
 
+      # A run started by hand: keep the files with the run, publish nothing.
+      - name: Attach the files to this run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tabula-${{ env.VERSION }}-windows
+          path: dist/
+          if-no-files-found: error
+
       - name: Publish the release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

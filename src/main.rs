@@ -34,8 +34,64 @@ use anyhow::bail;
 
 use crate::profiles::{AiAccess, Profile};
 
+/// A release build is a windowed program, so Windows gives it no console:
+/// started from a terminal, `tabula --help` would print into nothing. For
+/// the commands that talk to a terminal, join the one Tabula was started
+/// from. Output that is piped or redirected is left as it is.
+#[cfg(all(windows, not(debug_assertions)))]
+fn use_parent_console() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process: u32) -> i32;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            creation: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const STD_OUTPUT: u32 = -11i32 as u32;
+    const STD_ERROR: u32 = -12i32 as u32;
+    const INVALID: *mut c_void = -1isize as *mut c_void;
+    // GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING.
+    const ACCESS: u32 = 0xC000_0000;
+    const SHARE: u32 = 3;
+    const OPEN_EXISTING: u32 = 3;
+    // SAFETY: plain Win32 calls with valid arguments; `name` is a
+    // NUL-terminated UTF-16 string that outlives the call.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        for which in [STD_OUTPUT, STD_ERROR] {
+            let current = GetStdHandle(which);
+            if current.is_null() || current == INVALID {
+                let console =
+                    CreateFileW(name.as_ptr(), ACCESS, SHARE, std::ptr::null_mut(), OPEN_EXISTING, 0, std::ptr::null_mut());
+                if console != INVALID {
+                    SetStdHandle(which, console);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn use_parent_console() {}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("add" | "agents" | "ask" | "-h" | "--help" | "--version")) {
+        use_parent_console();
+    }
     let flag = |name: &str| {
         args.iter()
             .position(|a| a == name)
@@ -126,6 +182,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             });
+            Ok(())
+        }
+        Some("--version") => {
+            println!("tabula {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("-h" | "--help") => {
