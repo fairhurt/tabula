@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some("-h" | "--help") => {
-            println!("{}", include_str!("main.rs").lines().skip(3).take(12).map(|l| l.trim_start_matches("//!")).collect::<Vec<_>>().join("\n"));
+            println!("{}", include_str!("main.rs").lines().skip(3).take_while(|l| l.starts_with("//!")).map(|l| l.trim_start_matches("//!")).collect::<Vec<_>>().join("\n"));
             Ok(())
         }
         _ => {
