@@ -8,7 +8,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Editor, EditorState, InputEvent, InputState},
     table::{DataTable, TableEvent, TableState},
     v_flex,
 };
@@ -39,7 +39,8 @@ pub struct DataTab {
     pub title: SharedString,
     pub session: Arc<Session>,
     pub object: DbObject,
-    filter: Entity<InputState>,
+    /// A one-line SQL editor, so the filter gets highlighting and suggestions.
+    filter: Entity<EditorState>,
     table: Entity<TableState<ResultGrid>>,
     /// The input a cell turns into while it's edited.
     cell_input: Entity<InputState>,
@@ -69,8 +70,14 @@ impl DataTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let filter = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("e.g. status = 'paid' AND placed_at > now() - interval '1 day'")
+            EditorState::new(window, cx)
+                .language("sql")
+                .soft_wrap(false)
+                // Enter applies the filter instead of adding a line.
+                .submit_on_enter(true)
+                .placeholder("e.g. status = 'paid' AND placed_at > now() - interval '1 day'")
         });
+        super::sql_complete::attach(&filter, &session, Some((object.schema.clone(), object.name.clone())), cx);
         let cell_input = cx.new(|cx| InputState::new(window, cx));
         let table = cx.new(|cx| {
             let mut t = TableState::new(ResultGrid::new(true), window, cx);
@@ -177,7 +184,8 @@ impl DataTab {
     }
 
     fn sql(&self, cx: &gpui_kit::App) -> String {
-        let filter = self.filter.read(cx).value().to_string();
+        // One line: a pasted line break would otherwise hide part of it.
+        let filter = self.filter.read(cx).value().replace(['\n', '\r'], " ");
         db::browse_sql(
             &self.object,
             &filter,
@@ -555,7 +563,17 @@ impl Render for DataTab {
                             .text_color(theme.muted_foreground)
                             .child("WHERE"),
                     )
-                    .child(div().flex_1().child(Input::new(&self.filter).small()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(super::rem(30.))
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.input)
+                            .bg(theme.background)
+                            .overflow_hidden()
+                            .child(Editor::new(&self.filter).h_full().bordered(false)),
+                    )
                     .child(
                         Button::new("apply")
                             .small()

@@ -7,6 +7,7 @@ mod erd;
 mod grid;
 mod history;
 mod query;
+mod sql_complete;
 mod structure;
 mod workspace;
 

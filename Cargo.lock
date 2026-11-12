@@ -7378,6 +7378,7 @@ dependencies = [
  "ico",
  "interprocess",
  "keyring",
+ "lsp-types",
  "native-tls",
  "postgres-native-tls",
  "resvg 0.45.1",

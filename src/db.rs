@@ -599,6 +599,29 @@ impl Session {
         Ok((tables, keys))
     }
 
+    /// The names SQL completion suggests: every table and view in the
+    /// user's own schemas, with their columns.
+    pub async fn completion_catalog(&self) -> anyhow::Result<crate::complete::Catalog> {
+        let schemas: Vec<String> = self
+            .schemas()
+            .await?
+            .into_iter()
+            .filter(|s| s != "pg_catalog" && s != "information_schema")
+            .take(40)
+            .collect();
+        let mut tables = vec![];
+        for schema in &schemas {
+            let (found, _) = self.schema_map(schema).await?;
+            tables.extend(found.into_iter().map(|t| crate::complete::Table {
+                schema: schema.clone(),
+                name: t.name,
+                view: !matches!(t.kind, ObjectKind::Table | ObjectKind::ForeignTable),
+                columns: t.columns.into_iter().map(|c| (c.name, c.data_type)).collect(),
+            }));
+        }
+        Ok(crate::complete::Catalog { schemas, tables })
+    }
+
     /// Columns, indexes, constraints and DDL for a table or view.
     pub async fn table_info(&self, schema: &str, name: &str) -> anyhow::Result<TableInfo> {
         let rel = self
@@ -1154,6 +1177,11 @@ mod tests {
 
             let err = s.run("select * from nope", 10).await.unwrap_err();
             assert!(err.to_string().contains("42P01"), "{err}");
+
+            let catalog = s.completion_catalog().await.unwrap();
+            assert!(catalog.schemas.contains(&"shop".to_string()) && !catalog.schemas.contains(&"pg_catalog".to_string()));
+            let (_, found) = crate::complete::suggest(&catalog, "select o.cu from shop.orders o", 11, None);
+            assert_eq!(found[0].insert, "customer_id");
 
             let (tables, keys) = s.schema_map("shop").await.unwrap();
             let orders = tables.iter().find(|t| t.name == "orders").unwrap();

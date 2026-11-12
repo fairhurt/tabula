@@ -51,6 +51,8 @@ pub struct QueryTab {
     error: Option<String>,
     summary: Option<String>,
     last_sql: String,
+    /// The database's names, for the editor's suggestions.
+    catalog: super::sql_complete::SharedCatalog,
     focus: FocusHandle,
 }
 
@@ -81,8 +83,10 @@ impl QueryTab {
             t.cell_selectable = true;
             t
         });
+        let catalog = super::sql_complete::attach(&editor, &session, None, cx);
         QueryTab {
             title: title.into(),
+            catalog,
             session,
             editor,
             table,
@@ -175,6 +179,10 @@ impl QueryTab {
                 this.cancel = None;
                 if let Some(mut e) = entry.take() {
                     e.elapsed_ms = started.elapsed().as_millis() as u64;
+                    // New or changed tables should show up in the suggestions.
+                    if out.is_ok() && super::sql_complete::changes_schema(&e.sql) {
+                        super::sql_complete::reload(&this.catalog, &this.session, cx);
+                    }
                     match &out {
                         Ok(o) => e.rows = Some(o.results.iter().map(|r| r.row_count).sum()),
                         Err(err) => e.error = Some(err.to_string()),

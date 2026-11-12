@@ -36,7 +36,7 @@ Connections → databases → schemas → tables, views, materialized views, fun
 <td width="50%" valign="top">
 
 ### ⚡ Query without friction
-A highlighted SQL editor, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run the selection or everything, several statements at once, Stop, Plan, copy as TSV and save as CSV.
+A highlighted SQL editor that completes your tables, columns, aliases and SQL keywords as you type, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run the selection or everything, several statements at once, Stop, Plan, copy as TSV and save as CSV.
 
 </td>
 </tr>
@@ -58,7 +58,7 @@ Agents get read-only access, enforced by PostgreSQL itself. Writes can wait for 
 
 ## 📊 Data
 
-Page through 500 rows at a time, filter with any `WHERE` clause, and click a header to sort on the server. NULLs look like NULLs, numbers line up on the right, and the grid stays smooth on big tables.
+Page through 500 rows at a time, filter with any `WHERE` clause (the filter box completes the table's columns), and click a header to sort on the server. NULLs look like NULLs, numbers line up on the right, and the grid stays smooth on big tables.
 
 Tables with a primary key can be edited in place. Double-click a cell (or press <kbd>F2</kbd>) to change it, **+ Row** to add one, right-click for **Set to NULL**, **Duplicate row** and **Delete row**. Nothing touches the database until you press **Save** (<kbd>Ctrl</kbd>+<kbd>S</kbd>): edits are highlighted, **Review SQL** shows exactly what will run, and everything is applied in one transaction, so either all of it is saved or none of it. An update or delete that no longer matches exactly one row stops the save.
 
