@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     input::{Escape, Input, InputState},
-    menu::{PopupMenu, PopupMenuItem},
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     table::{Column, ColumnSort, TableDelegate, TableSelection, TableState},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -296,6 +296,44 @@ impl ResultGrid {
     }
 }
 
+/// The right-click menu for a cell (`col` known) or for a row.
+fn cell_menu(
+    menu: PopupMenu,
+    table: gpui_kit::WeakEntity<TableState<ResultGrid>>,
+    row_ix: usize,
+    col: Option<usize>,
+    editable: bool,
+    deleted: bool,
+) -> PopupMenu {
+    let item = |label: &str, ic: &str, make: fn(usize, Option<usize>) -> Option<GridRequest>| {
+        let table = table.clone();
+        PopupMenuItem::new(label.to_string()).icon(icon(ic)).on_click(move |_, _, cx| {
+            let _ = table.update(cx, |t, cx| {
+                let col = col.or_else(|| menu_column(t, row_ix));
+                t.delegate_mut().request = make(row_ix, col);
+                cx.notify();
+            });
+        })
+    };
+    let mut menu = menu.item(item("View value", "maximize-2", |r, c| Some(GridRequest::View(r, c.unwrap_or(0)))));
+    if !editable {
+        return menu;
+    }
+    menu = menu.separator();
+    if !deleted {
+        menu = menu
+            .item(item("Edit cell", "square-pen", |r, c| c.map(|c| GridRequest::Edit(r, c))))
+            .item(item("Set to NULL", "circle-slash", |r, c| c.map(|c| GridRequest::SetNull(r, c))))
+            .separator()
+            .item(item("Duplicate row", "copy-plus", |r, _| Some(GridRequest::Duplicate(r))));
+    }
+    menu.item(item(
+        if deleted { "Keep row" } else { "Delete row" },
+        if deleted { "undo-2" } else { "trash-2" },
+        |r, _| Some(GridRequest::ToggleDelete(r)),
+    ))
+}
+
 /// The column of the cell a row's context menu was opened on.
 fn menu_column(table: &TableState<ResultGrid>, row_ix: usize) -> Option<usize> {
     table
@@ -504,45 +542,8 @@ impl TableDelegate for ResultGrid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let table = cx.entity().downgrade();
-        let view = {
-            let table = table.clone();
-            PopupMenuItem::new("View value").icon(icon("maximize-2")).on_click(move |_, _, cx| {
-                let _ = table.update(cx, |t, cx| {
-                    let col = menu_column(t, row_ix).unwrap_or(0);
-                    t.delegate_mut().request = Some(GridRequest::View(row_ix, col));
-                    cx.notify();
-                });
-            })
-        };
-        if !self.editable() {
-            return menu.item(view);
-        }
-        let menu = menu.item(view).separator();
-        let deleted = self.is_deleted(row_ix);
-        let item = |label: &str, ic: &str, make: fn(usize, Option<usize>) -> Option<GridRequest>| {
-            let table = table.clone();
-            PopupMenuItem::new(label.to_string()).icon(icon(ic)).on_click(move |_, _, cx| {
-                let _ = table.update(cx, |t, cx| {
-                    let col = menu_column(t, row_ix);
-                    t.delegate_mut().request = make(row_ix, col);
-                    cx.notify();
-                });
-            })
-        };
-        let mut menu = menu;
-        if !deleted {
-            menu = menu
-                .item(item("Edit cell", "square-pen", |r, c| c.map(|c| GridRequest::Edit(r, c))))
-                .item(item("Set to NULL", "circle-slash", |r, c| c.map(|c| GridRequest::SetNull(r, c))))
-                .separator()
-                .item(item("Duplicate row", "copy-plus", |r, _| Some(GridRequest::Duplicate(r))));
-        }
-        menu.item(item(
-            if deleted { "Keep row" } else { "Delete row" },
-            if deleted { "undo-2" } else { "trash-2" },
-            |r, _| Some(GridRequest::ToggleDelete(r)),
-        ))
+        // A right-click on the row but outside any cell: no column is known.
+        cell_menu(menu, cx.entity().downgrade(), row_ix, None, self.editable(), self.is_deleted(row_ix))
     }
 
     fn render_td(
@@ -568,6 +569,20 @@ impl TableDelegate for ResultGrid {
         let numeric = self.columns.get(col_ix).is_some_and(|c| c.is_numeric());
         let state = self.row_state(row_ix);
         let edited = self.is_edited(row_ix, col_ix);
+        // The table swallows right-clicks on cells, so its row menu never
+        // opens there: each cell carries the menu itself, filling the cell
+        // so the whole of it responds.
+        let (table, editable, deleted) = (cx.entity().downgrade(), self.editable(), state == RowState::Deleted);
+        let with_menu = move |content: gpui_kit::AnyElement| {
+            div()
+                .id(("cell", row_ix * 4096 + col_ix))
+                .size_full()
+                .flex()
+                .items_center()
+                .child(content)
+                .context_menu(move |menu, _, _| cell_menu(menu, table.clone(), row_ix, Some(col_ix), editable, deleted))
+                .into_any_element()
+        };
         let cell = div()
             .w_full()
             .overflow_hidden()
@@ -582,22 +597,18 @@ impl TableDelegate for ResultGrid {
             });
         match self.value(row_ix, col_ix) {
             // A new row's untouched cells take the column default.
-            None if state == RowState::New && !edited => cell
-                .italic()
-                .text_color(theme.muted_foreground.opacity(0.5))
-                .child("default")
-                .into_any_element(),
-            None => cell
-                .italic()
-                .text_color(theme.muted_foreground.opacity(0.7))
-                .child("NULL")
-                .into_any_element(),
+            None if state == RowState::New && !edited => with_menu(
+                cell.italic().text_color(theme.muted_foreground.opacity(0.5)).child("default").into_any_element(),
+            ),
+            None => with_menu(
+                cell.italic().text_color(theme.muted_foreground.opacity(0.7)).child("NULL").into_any_element(),
+            ),
             Some(v) => {
                 let mut s: String = v.chars().take(CELL_CHARS).collect();
                 if s.contains(['\n', '\r', '\t']) {
                     s = s.replace(['\n', '\r', '\t'], " ");
                 }
-                cell.child(s).into_any_element()
+                with_menu(cell.child(s).into_any_element())
             }
         }
     }
