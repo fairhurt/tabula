@@ -78,6 +78,50 @@ pub fn scale(cx: &App, v: f32) -> Pixels {
     px(v * cx.theme().font_size.as_f32() / 13.)
 }
 
+/// Switch between the dark and light themes, keeping Tabula's accent colour
+/// and text size.
+pub fn set_theme(cx: &mut App, dark: bool, font_size: f32) {
+    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
+    Theme::update(cx, |t| {
+        t.font_size = px(font_size);
+        t.mono_font_size = px(font_size - 1.);
+        t.radius = px(6.);
+        // A database-blue accent.
+        let (primary, hover) = if dark { (0x3b82f6, 0x60a5fa) } else { (0x2563eb, 0x1d4ed8) };
+        t.primary = c(primary);
+        t.primary_hover = c(hover);
+        t.primary_active = c(hover);
+        t.button_primary = c(primary);
+        t.button_primary_hover = c(hover);
+        t.button_primary_active = c(hover);
+        t.ring = c(primary);
+        t.caret = c(primary);
+        t.link = c(primary);
+    });
+    cx.refresh_windows();
+}
+
+/// Where to open the window: where it was last time, if that is still on a
+/// screen, else centred.
+fn window_bounds(saved: Option<settings::WindowPlace>, cx: &App) -> WindowBounds {
+    let centred = WindowBounds::Windowed(Bounds::centered(None, size(px(1400.), px(880.)), cx));
+    let Some(w) = saved.filter(|w| w.width >= 400. && w.height >= 300.) else {
+        return centred;
+    };
+    // The title bar must land on a screen that is still connected.
+    let (grab_x, grab_y) = (w.x + w.width.min(200.), w.y + 10.);
+    let on_screen = cx.displays().iter().any(|d| {
+        let b = d.bounds();
+        let (x0, y0) = (b.origin.x.as_f32(), b.origin.y.as_f32());
+        grab_x >= x0 && grab_x <= x0 + b.size.width.as_f32() && grab_y >= y0 && grab_y <= y0 + b.size.height.as_f32()
+    });
+    if !on_screen {
+        return centred;
+    }
+    let bounds = Bounds { origin: point(px(w.x), px(w.y)), size: size(px(w.width), px(w.height)) };
+    if w.maximized { WindowBounds::Maximized(bounds) } else { WindowBounds::Windowed(bounds) }
+}
+
 /// Set the UI text size; rem-based sizes and the SQL editor follow it.
 pub fn set_font_size(cx: &mut App, size: f32) {
     Theme::update(cx, |t| {
@@ -102,23 +146,11 @@ macro_rules! key {
 /// screenshots need.
 fn setup(cx: &mut App, dark: bool, font_size: f32) {
     gpui_kit::init(cx);
-    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
-    Theme::update(cx, |t| {
-        t.font_size = px(font_size);
-        t.mono_font_size = px(font_size - 1.);
-        t.radius = px(6.);
-        // A database-blue accent.
-        let (primary, hover) = if dark { (0x3b82f6, 0x60a5fa) } else { (0x2563eb, 0x1d4ed8) };
-        t.primary = c(primary);
-        t.primary_hover = c(hover);
-        t.primary_active = c(hover);
-        t.button_primary = c(primary);
-        t.button_primary_hover = c(hover);
-        t.button_primary_active = c(hover);
-        t.ring = c(primary);
-        t.caret = c(primary);
-        t.link = c(primary);
-    });
+    set_theme(cx, dark, font_size);
+    bind_keys(cx);
+}
+
+fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(key!("enter"), RunQuery, Some("QueryTab")),
         KeyBinding::new("f5", RunQuery, Some("QueryTab")),
@@ -142,15 +174,16 @@ pub fn run(url: Option<String>, connect: Option<String>) -> anyhow::Result<()> {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
-            let dark = !matches!(
+            let saved = settings::load();
+            let dark = saved.dark().unwrap_or(!matches!(
                 cx.window_appearance(),
                 gpui_kit::WindowAppearance::Light | gpui_kit::WindowAppearance::VibrantLight
-            );
-            setup(cx, dark, settings::load().font_size());
-            let bounds = Bounds::centered(None, size(px(1400.), px(880.)), cx);
+            ));
+            setup(cx, dark, saved.font_size());
+            let bounds = window_bounds(saved.window, cx);
             let opened = gpui_kit::open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(bounds),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Tabula".into()),
                         ..Default::default()

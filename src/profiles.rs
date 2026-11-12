@@ -17,16 +17,30 @@ pub enum SslMode {
     #[default]
     Prefer,
     Require,
+    /// Encrypt, and refuse a server whose certificate isn't trusted by this
+    /// computer or doesn't match the host name (libpq's `verify-full`).
+    Verify,
 }
 
 impl SslMode {
-    pub const ALL: [SslMode; 3] = [SslMode::Disable, SslMode::Prefer, SslMode::Require];
+    pub const ALL: [SslMode; 4] = [SslMode::Disable, SslMode::Prefer, SslMode::Require, SslMode::Verify];
 
     pub fn label(self) -> &'static str {
         match self {
             SslMode::Disable => "disable",
             SslMode::Prefer => "prefer",
             SslMode::Require => "require",
+            SslMode::Verify => "verify",
+        }
+    }
+
+    /// What the mode protects against, in a sentence.
+    pub fn hint(self) -> &'static str {
+        match self {
+            SslMode::Disable => "Not encrypted. Fine for a database on this computer.",
+            SslMode::Prefer => "Encrypted if the server offers it; the server's identity isn't checked.",
+            SslMode::Require => "Always encrypted, but the server's identity isn't checked, so the connection could be intercepted.",
+            SslMode::Verify => "Always encrypted, and the server must prove who it is with a trusted certificate for this host. Use this over the internet.",
         }
     }
 }
@@ -122,7 +136,8 @@ impl Profile {
             if k == "sslmode" {
                 p.ssl = match v.as_ref() {
                     "disable" => SslMode::Disable,
-                    "require" | "verify-ca" | "verify-full" => SslMode::Require,
+                    "require" => SslMode::Require,
+                    "verify-ca" | "verify-full" | "verify" => SslMode::Verify,
                     _ => SslMode::Prefer,
                 };
             }
@@ -271,6 +286,10 @@ mod tests {
         assert_eq!(p.port, 6543);
         assert_eq!(p.database, "shop");
         assert_eq!(p.ssl, SslMode::Require);
+        let (p, _) = Profile::from_url("", "postgres://alice@db.example.com/shop?sslmode=verify-full").unwrap();
+        assert_eq!(p.ssl, SslMode::Verify);
+        // Saved as a plain word, and older files without it still load.
+        assert_eq!(serde_json::to_string(&SslMode::Verify).unwrap(), "\"verify\"");
         assert_eq!(p.name, "shop@db.example.com");
         assert!(Profile::from_url("x", "mysql://a@b/c").is_err());
     }

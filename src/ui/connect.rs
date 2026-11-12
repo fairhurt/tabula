@@ -256,6 +256,13 @@ impl Render for ConnectForm {
                     .children(ssl_buttons),
             )
             .child(
+                div()
+                    .pl(super::rem(78.))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(self.ssl.hint()),
+            )
+            .child(
                 v_flex()
                     .gap_1()
                     .child(

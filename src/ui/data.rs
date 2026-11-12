@@ -55,6 +55,8 @@ pub struct DataTab {
     save_error: Option<String>,
     /// Show the SQL the pending changes will run.
     review: bool,
+    /// A cell's whole value, shown over the grid.
+    viewing: Option<grid::CellValue>,
     rows_on_page: usize,
     elapsed_ms: f64,
     _subs: Vec<Subscription>,
@@ -107,6 +109,10 @@ impl DataTab {
                     }
                 }
                 match request {
+                    Some(GridRequest::View(r, c)) => {
+                        this.viewing = table.read(cx).delegate().cell_value(r, c);
+                        cx.notify();
+                    }
                     Some(GridRequest::Edit(r, c)) => this.start_edit(r, c, window, cx),
                     Some(GridRequest::SetNull(r, c)) => this.stage(cx, |g| g.set_cell(r, c, None)),
                     Some(GridRequest::ToggleDelete(r)) => this.stage(cx, |g| g.toggle_delete(r)),
@@ -142,6 +148,7 @@ impl DataTab {
             error: None,
             save_error: None,
             review: false,
+            viewing: None,
             rows_on_page: 0,
             elapsed_ms: 0.,
             _subs: subs,
@@ -539,8 +546,20 @@ impl Render for DataTab {
                 )
                 .into_any_element(),
         };
+        let viewer = self.viewing.as_ref().map(|v| {
+            grid::value_viewer(
+                v,
+                cx.listener(|this, _, _, cx| {
+                    this.viewing = None;
+                    cx.notify();
+                }),
+                cx,
+            )
+        });
         v_flex()
             .size_full()
+            .relative()
+            .children(viewer)
             .key_context("DataTab")
             .on_action(cx.listener(|this, _: &SaveChanges, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &EditCell, window, cx| {

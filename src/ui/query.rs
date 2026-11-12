@@ -51,6 +51,9 @@ pub struct QueryTab {
     error: Option<String>,
     summary: Option<String>,
     last_sql: String,
+    /// A cell's whole value, shown over the tab.
+    viewing: Option<grid::CellValue>,
+    _subs: Vec<gpui_kit::Subscription>,
     /// The database's names, for the editor's suggestions.
     catalog: super::sql_complete::SharedCatalog,
     focus: FocusHandle,
@@ -84,8 +87,26 @@ impl QueryTab {
             t
         });
         let catalog = super::sql_complete::attach(&editor, &session, None, cx);
+        let subs = vec![
+            // Double-click a cell, or "View value" in its menu, to read all of it.
+            cx.subscribe(&table, |this, table, e: &gpui_kit::component::table::TableEvent, cx| {
+                if let gpui_kit::component::table::TableEvent::DoubleClickedCell(r, c) = e {
+                    this.viewing = table.read(cx).delegate().cell_value(*r, *c);
+                    cx.notify();
+                }
+            }),
+            cx.observe(&table, |this, table, cx| {
+                let request = table.update(cx, |t, _| t.delegate_mut().request.take());
+                if let Some(grid::GridRequest::View(r, c)) = request {
+                    this.viewing = table.read(cx).delegate().cell_value(r, c);
+                    cx.notify();
+                }
+            }),
+        ];
         QueryTab {
             title: title.into(),
+            viewing: None,
+            _subs: subs,
             catalog,
             session,
             editor,
@@ -516,8 +537,20 @@ enum AiAsk {
 
 impl Render for QueryTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewer = self.viewing.as_ref().map(|v| {
+            grid::value_viewer(
+                v,
+                cx.listener(|this, _, _, cx| {
+                    this.viewing = None;
+                    cx.notify();
+                }),
+                cx,
+            )
+        });
         v_flex()
             .size_full()
+            .relative()
+            .children(viewer)
             .key_context("QueryTab")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run(cx)))

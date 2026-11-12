@@ -68,6 +68,8 @@ Agents get read-only access, enforced by PostgreSQL itself. Writes can wait for 
 
 Page through 500 rows at a time, filter with any `WHERE` clause (the filter box completes the table's columns), and click a header to sort on the server. NULLs look like NULLs, numbers line up on the right, and the grid stays smooth on big tables.
 
+Double-click a cell in a query's results, or right-click any cell and choose **View value**, to read the whole value: long text in full, JSON indented, with a Copy button.
+
 Tables with a primary key can be edited in place. Double-click a cell (or press <kbd>F2</kbd>) to change it, **+ Row** to add one, right-click for **Set to NULL**, **Duplicate row** and **Delete row**. Nothing touches the database until you press **Save** (<kbd>Ctrl</kbd>+<kbd>S</kbd>): edits are highlighted, **Review SQL** shows exactly what will run, and everything is applied in one transaction, so either all of it is saved or none of it. An update or delete that no longer matches exactly one row stops the save.
 
 <picture>
@@ -127,6 +129,15 @@ No API keys: both agents run signed in as you, with **only Tabula's tools** — 
 ### What agents may do
 
 Set per connection, in the connection dialog:
+
+The same dialog sets how the connection is secured:
+
+| SSL | What it does |
+| --- | --- |
+| **disable** | No encryption. Fine for a database on this computer. |
+| **prefer** *(default)* | Encrypts if the server offers it. The server's identity isn't checked. |
+| **require** | Always encrypts, but the server's identity isn't checked, so the connection could be intercepted. |
+| **verify** | Always encrypts, and the server must present a certificate this computer trusts for that host name (PostgreSQL's `verify-full`). Use this over the internet. |
 
 | AI access | Agents can… |
 | --- | --- |
@@ -224,6 +235,8 @@ git push origin v0.3.0
 The Release workflow tests, builds the installer and a portable zip with checksums, and publishes them as a GitHub release. Installed copies offer the update the next time they start.
 
 The app icon is drawn in `assets/icon.svg`; the build renders it and, on Windows, embeds it in the executable.
+
+The sun/moon button in the status bar switches between the light and dark themes; without a choice Tabula follows the system. It also remembers where its window was.
 
 Saved connections live in your config folder (`tabula/connections.json`), next to `settings.json` (text size, Ask AI agent and model) and `history.jsonl`. Passwords go in the OS credential store on Windows and macOS, and in a file only you can read on Linux.
 

@@ -372,16 +372,18 @@ async fn open(profile: &Profile, password: Option<&str>) -> anyhow::Result<Clien
             client
         }
         mode => {
-            cfg.ssl_mode(if mode == SslMode::Require {
-                tokio_postgres::config::SslMode::Require
-            } else {
+            cfg.ssl_mode(if mode == SslMode::Prefer {
                 tokio_postgres::config::SslMode::Prefer
+            } else {
+                tokio_postgres::config::SslMode::Require
             });
             // libpq's `prefer` and `require` encrypt without verifying the
-            // certificate; match that.
+            // certificate; match that. `verify` checks the certificate
+            // against this computer's trusted roots, and the host name.
+            let verify = mode == SslMode::Verify;
             let tls = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
+                .danger_accept_invalid_certs(!verify)
+                .danger_accept_invalid_hostnames(!verify)
                 .build()
                 .context("TLS setup failed")?;
             let tls = postgres_native_tls::MakeTlsConnector::new(tls);

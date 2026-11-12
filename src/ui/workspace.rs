@@ -322,6 +322,25 @@ impl Workspace {
             updating: false,
             _subs: vec![sub],
         };
+        if live {
+            // Remember where the window was, for next time.
+            let this = cx.entity().downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                let place = window.window_bounds();
+                let b = place.get_bounds();
+                let _ = this.update(cx, |ws, _| {
+                    ws.settings.window = Some(settings::WindowPlace {
+                        x: b.origin.x.as_f32(),
+                        y: b.origin.y.as_f32(),
+                        width: b.size.width.as_f32(),
+                        height: b.size.height.as_f32(),
+                        maximized: matches!(place, gpui_kit::WindowBounds::Maximized(_)),
+                    });
+                    ws.save_settings();
+                });
+                true
+            });
+        }
         if live && ws.settings.check_for_updates && crate::update::enabled() {
             ws.check_for_update(cx);
         }
@@ -995,6 +1014,16 @@ impl Workspace {
         if let Err(e) = settings::save(&self.settings) {
             self.status = format!("Couldn't save settings: {e}").into();
         }
+    }
+
+    /// Switch between the dark and light themes, and remember the choice.
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        let dark = !cx.theme().is_dark();
+        self.settings.theme = Some(if dark { "dark" } else { "light" }.into());
+        self.save_settings();
+        super::set_theme(cx, dark, self.settings.font_size());
+        self.status = if dark { "Dark theme" } else { "Light theme" }.into();
+        cx.notify();
     }
 
     /// Change the text size by `delta` pixels, or reset it with `None`.
@@ -1910,6 +1939,14 @@ impl Workspace {
                     .label("History")
                     .tooltip("Query history (Ctrl+H)")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_history(window, cx))),
+            )
+            .child(
+                Button::new("status-theme")
+                    .xsmall()
+                    .ghost()
+                    .icon(icon(if cx.theme().is_dark() { "sun" } else { "moon" }))
+                    .tooltip(if cx.theme().is_dark() { "Switch to the light theme" } else { "Switch to the dark theme" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
             )
             .child(
                 Button::new("status-zoom")

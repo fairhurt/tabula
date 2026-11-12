@@ -23,6 +23,8 @@ use crate::db::{self, Change, ResultColumn};
 /// picks it up. Rows and columns are as displayed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GridRequest {
+    /// Show the whole value of a cell.
+    View(usize, usize),
     Edit(usize, usize),
     SetNull(usize, usize),
     ToggleDelete(usize),
@@ -290,6 +292,124 @@ impl ResultGrid {
     }
 }
 
+/// A cell's whole value, opened from the grid to read or copy.
+pub struct CellValue {
+    pub column: String,
+    pub type_name: Option<String>,
+    /// `None` is NULL.
+    pub text: Option<String>,
+}
+
+/// Most characters drawn in the viewer; the rest is still copied.
+const VIEW_CHARS: usize = 200_000;
+
+impl ResultGrid {
+    /// The whole value of a cell, for the viewer.
+    pub fn cell_value(&self, row_ix: usize, col_ix: usize) -> Option<CellValue> {
+        let column = self.columns.get(col_ix)?;
+        Some(CellValue {
+            column: column.name.clone(),
+            type_name: column.type_name.clone(),
+            text: self.value(row_ix, col_ix).map(str::to_string),
+        })
+    }
+}
+
+impl CellValue {
+    /// The value laid out for reading: JSON is indented.
+    pub fn pretty(&self) -> Option<String> {
+        let text = self.text.as_deref()?;
+        let looks_like_json = matches!(self.type_name.as_deref(), Some("json" | "jsonb"))
+            || matches!(text.trim_start().chars().next(), Some('{' | '['));
+        if looks_like_json {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Ok(p) = serde_json::to_string_pretty(&v) {
+                    return Some(p);
+                }
+            }
+        }
+        Some(text.to_string())
+    }
+}
+
+/// The panel that shows a cell's whole value over a tab. `close` is called
+/// by its close button.
+pub fn value_viewer(
+    value: &CellValue,
+    close: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    use gpui_kit::StatefulInteractiveElement as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
+    let theme = cx.theme();
+    let pretty = value.pretty();
+    let chars = pretty.as_ref().map_or(0, |p| p.chars().count());
+    let shown: Option<String> = pretty.as_ref().map(|p| p.chars().take(VIEW_CHARS).collect());
+    let copy = pretty.clone().unwrap_or_default();
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui_kit::black().opacity(0.35))
+        .occlude()
+        .child(
+            v_flex()
+                .w(super::rem(720.))
+                .max_w_full()
+                .max_h(gpui_kit::relative(0.85))
+                .m_4()
+                .bg(theme.popover)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius_lg)
+                .shadow_lg()
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(div().font_semibold().text_sm().child(value.column.clone()))
+                        .children(value.type_name.clone().map(|t| {
+                            div().text_xs().font_family(theme.mono_font_family.clone()).text_color(theme.primary).child(t)
+                        }))
+                        .child(div().flex_1().text_xs().text_color(theme.muted_foreground).child(match &pretty {
+                            None => "NULL".to_string(),
+                            Some(_) if chars > VIEW_CHARS => format!("{chars} characters, first {VIEW_CHARS} shown"),
+                            Some(_) => format!("{chars} character{}", if chars == 1 { "" } else { "s" }),
+                        }))
+                        .child(
+                            Button::new("value-copy")
+                                .xsmall()
+                                .ghost()
+                                .icon(icon("copy"))
+                                .label("Copy")
+                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
+                        )
+                        .child(Button::new("value-close").xsmall().ghost().icon(icon("x")).on_click(close)),
+                )
+                .child(
+                    div()
+                        .id("value-text")
+                        .flex_1()
+                        .min_h(super::rem(80.))
+                        .overflow_y_scroll()
+                        .p_3()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(super::rem(12.5))
+                        .map(|d| match shown {
+                            Some(text) => d.whitespace_normal().child(text),
+                            None => d.italic().text_color(theme.muted_foreground).child("NULL"),
+                        }),
+                ),
+        )
+}
+
 /// Copy the grid's selection (or all of it) to the clipboard.
 pub fn copy_selection(table: &gpui_kit::Entity<TableState<ResultGrid>>, cx: &mut App) {
     let t = table.read(cx);
@@ -368,10 +488,21 @@ impl TableDelegate for ResultGrid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        if !self.editable() {
-            return menu;
-        }
         let table = cx.entity().downgrade();
+        let view = {
+            let table = table.clone();
+            PopupMenuItem::new("View value").icon(icon("maximize-2")).on_click(move |_, _, cx| {
+                let _ = table.update(cx, |t, cx| {
+                    let cell = t.right_clicked_cell().or(t.selected_cell()).filter(|(r, _)| *r == row_ix);
+                    t.delegate_mut().request = cell.map(|(r, c)| GridRequest::View(r, c));
+                    cx.notify();
+                });
+            })
+        };
+        if !self.editable() {
+            return menu.item(view);
+        }
+        let menu = menu.item(view).separator();
         let deleted = self.is_deleted(row_ix);
         let item = |label: &str, ic: &str, make: fn(usize, Option<usize>) -> Option<GridRequest>| {
             let table = table.clone();
@@ -466,5 +597,24 @@ impl TableDelegate for ResultGrid {
 
     fn loading(&self, _: &App) -> bool {
         self.loading
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(type_name: Option<&str>, text: Option<&str>) -> CellValue {
+        CellValue { column: "prefs".into(), type_name: type_name.map(str::to_string), text: text.map(str::to_string) }
+    }
+
+    #[test]
+    fn the_viewer_indents_json_and_leaves_other_text_alone() {
+        assert_eq!(value(Some("jsonb"), Some(r#"{"a":1,"b":[true]}"#)).pretty().unwrap(), "{\n  \"a\": 1,\n  \"b\": [\n    true\n  ]\n}");
+        // JSON kept in a text column is indented too.
+        assert!(value(Some("text"), Some("[1,2]")).pretty().unwrap().contains('\n'));
+        assert_eq!(value(Some("text"), Some("{not json")).pretty().unwrap(), "{not json");
+        assert_eq!(value(Some("text"), Some("plain")).pretty().unwrap(), "plain");
+        assert_eq!(value(Some("text"), None).pretty(), None);
     }
 }

@@ -22,6 +22,21 @@ pub struct Settings {
     pub models: HashMap<String, String>,
     /// Ask GitHub at startup whether a newer Tabula is out.
     pub check_for_updates: bool,
+    /// "light" or "dark"; absent follows the system.
+    pub theme: Option<String>,
+    /// Where the window was when it last closed.
+    pub window: Option<WindowPlace>,
+}
+
+/// A window's position and size, in the screen's logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowPlace {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 impl Default for Settings {
@@ -31,11 +46,23 @@ impl Default for Settings {
             agent: None,
             models: HashMap::new(),
             check_for_updates: true,
+            theme: None,
+            window: None,
         }
     }
 }
 
 impl Settings {
+    /// The chosen theme: `Some(true)` dark, `Some(false)` light, `None` to
+    /// follow the system.
+    pub fn dark(&self) -> Option<bool> {
+        match self.theme.as_deref() {
+            Some("dark") => Some(true),
+            Some("light") => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn font_size(&self) -> f32 {
         if self.font_size.is_finite() {
             self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
@@ -73,6 +100,11 @@ mod tests {
         assert_eq!(s.font_size(), MAX_FONT_SIZE);
         assert!(s.models.is_empty());
         assert!(s.check_for_updates);
+        assert_eq!(s.dark(), None);
+        let s: Settings =
+            serde_json::from_str(r#"{"theme": "light", "window": {"x": 10, "y": 20, "width": 900, "height": 600}}"#).unwrap();
+        assert_eq!(s.dark(), Some(false));
+        assert_eq!(s.window.map(|w| (w.width, w.maximized)), Some((900., false)));
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.font_size(), DEFAULT_FONT_SIZE);
     }
