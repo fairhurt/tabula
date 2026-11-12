@@ -28,12 +28,13 @@ use super::connect::{ConnectEvent, ConnectForm};
 use super::data::DataTab;
 use super::query::{QueryEvent, QueryTab};
 use super::structure::{StructureTab, kind_icon};
-use super::{CloseTab, NewQuery, Refresh, ToggleAi, icon};
+use super::{CloseTab, NewQuery, Refresh, ToggleAi, ZoomIn, ZoomOut, ZoomReset, icon};
 use crate::agents::{Agent, McpStatus};
 use crate::db::{DbObject, ObjectKind, Session};
 use crate::link::{self, LinkReply, LinkRequest};
 use crate::profiles::{self, AiAccess, Profile};
 use crate::rt;
+use crate::settings::{self, Settings};
 
 #[derive(Clone, PartialEq)]
 enum LoadState {
@@ -205,6 +206,7 @@ pub struct Workspace {
     exe: std::path::PathBuf,
     focus: FocusHandle,
     query_count: usize,
+    settings: Settings,
     _subs: Vec<Subscription>,
 }
 
@@ -266,6 +268,7 @@ impl Workspace {
             exe: std::env::current_exe().unwrap_or_default(),
             focus: cx.focus_handle(),
             query_count: 0,
+            settings: if live { settings::load() } else { Settings::default() },
             _subs: vec![sub],
         };
         if let Some((ix, pw)) = auto {
@@ -783,6 +786,27 @@ impl Workspace {
         }
     }
 
+    // ------------------------------------------------------------ settings
+
+    fn save_settings(&mut self) {
+        if let Err(e) = settings::save(&self.settings) {
+            self.status = format!("Couldn't save settings: {e}").into();
+        }
+    }
+
+    /// Change the text size by `delta` pixels, or reset it with `None`.
+    fn zoom(&mut self, delta: Option<f32>, cx: &mut Context<Self>) {
+        let size = match delta {
+            Some(d) => (self.settings.font_size() + d).clamp(settings::MIN_FONT_SIZE, settings::MAX_FONT_SIZE),
+            None => settings::DEFAULT_FONT_SIZE,
+        };
+        self.settings.font_size = size;
+        self.save_settings();
+        super::set_font_size(cx, size);
+        self.status = format!("Text size {size:.0}px").into();
+        cx.notify();
+    }
+
     // ------------------------------------------------------------ modals
 
     fn open_connect(&mut self, edit: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1150,8 +1174,8 @@ impl Workspace {
                         h_flex()
                             .id(("tree-row", i))
                             .w_full()
-                            .h(px(24.))
-                            .pl(px(6. + r.depth as f32 * 14.))
+                            .h(super::rem(24.))
+                            .pl(super::rem(6. + r.depth as f32 * 14.))
                             .pr_2()
                             .gap_1()
                             .text_sm()
@@ -1159,7 +1183,7 @@ impl Workspace {
                             .when(selected, |d| d.bg(theme.sidebar_accent))
                             .hover(|d| d.bg(theme.sidebar_accent.opacity(0.6)))
                             .child(
-                                div().w(px(12.)).flex_shrink_0().when(r.expandable, |d| {
+                                div().w(super::rem(12.)).flex_shrink_0().when(r.expandable, |d| {
                                     d.child(
                                         icon(if r.expanded { "chevron-down" } else { "chevron-right" })
                                             .xsmall()
@@ -1270,7 +1294,7 @@ impl Workspace {
         let theme = cx.theme().clone();
         h_flex()
             .id("tab-strip")
-            .h(px(34.))
+            .h(super::rem(34.))
             .flex_shrink_0()
             .bg(theme.tab_bar)
             .border_b_1()
@@ -1331,7 +1355,7 @@ impl Workspace {
                 .gap_3()
                 .child(
                     div()
-                        .w(px(110.))
+                        .w(super::rem(110.))
                         .text_right()
                         .font_family(theme.mono_font_family.clone())
                         .text_xs()
@@ -1393,8 +1417,8 @@ impl Workspace {
         let theme = cx.theme().clone();
         let exe = self.exe.clone();
         v_flex()
-            .w(px(640.))
-            .max_h(px(620.))
+            .w(super::rem(640.))
+            .max_h(super::rem(620.))
             .p_5()
             .gap_3()
             .bg(theme.popover)
@@ -1492,7 +1516,7 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("activity")
-                    .max_h(px(200.))
+                    .max_h(super::rem(200.))
                     .overflow_y_scroll()
                     .gap_1()
                     .when(self.activity.is_empty(), |d| {
@@ -1522,7 +1546,7 @@ impl Workspace {
     fn render_approval(&self, a: &Approval, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         v_flex()
-            .w(px(600.))
+            .w(super::rem(600.))
             .p_5()
             .gap_3()
             .bg(theme.popover)
@@ -1545,13 +1569,13 @@ impl Workspace {
             .child(
                 div()
                     .id("approve-sql")
-                    .max_h(px(260.))
+                    .max_h(super::rem(260.))
                     .overflow_y_scroll()
                     .p_3()
                     .rounded(theme.radius)
                     .bg(theme.muted)
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(12.))
+                    .text_size(super::rem(12.))
                     .child(a.sql.clone()),
             )
             .child(
@@ -1585,7 +1609,7 @@ impl Workspace {
             .filter(|d| d.session.is_some())
             .count();
         h_flex()
-            .h(px(26.))
+            .h(super::rem(26.))
             .px_3()
             .gap_3()
             .flex_shrink_0()
@@ -1596,6 +1620,15 @@ impl Workspace {
             .text_color(theme.muted_foreground)
             .child(div().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.status.clone()))
             .child(format!("{connected} open"))
+            .child(
+                Button::new("status-zoom")
+                    .xsmall()
+                    .ghost()
+                    .icon(icon("a-large-small"))
+                    .label(format!("{:.0}px", self.settings.font_size()))
+                    .tooltip("Text size: Ctrl+= / Ctrl+- to change, click to reset")
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom(None, cx))),
+            )
             .child(
                 Button::new("status-agents")
                     .xsmall()
@@ -1703,6 +1736,9 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(Some(1.), cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(Some(-1.), cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(None, cx)))
             .child(div().flex_1().min_h_0().child(split))
             .child(self.render_status(cx))
             .children(modal.map(|m| {

@@ -15,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div,
 };
 
 use super::icon;
@@ -97,7 +97,7 @@ impl StructureTab {
         let theme = cx.theme();
         let cell = |text: String, w: f32, color: Option<Hsla>| {
             div()
-                .w(px(w))
+                .w(super::rem(w))
                 .flex_shrink_0()
                 .px_2()
                 .py_1()
@@ -259,7 +259,7 @@ impl Render for StructureTab {
         )
         .child(
             div()
-                .h(px(320.))
+                .h(super::rem(320.))
                 .flex_shrink_0()
                 .border_1()
                 .border_color(theme.border)

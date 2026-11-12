@@ -13,7 +13,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div, px,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div,
 };
 
 use super::grid::{self, ResultGrid};
@@ -175,7 +175,7 @@ impl Render for DataTab {
                 .bg(theme.danger.opacity(0.08))
                 .text_color(theme.danger)
                 .font_family(theme.mono_font_family.clone())
-                .text_size(px(12.))
+                .text_size(super::rem(12.))
                 .child(e.clone())
                 .into_any_element(),
             None => div()
@@ -184,7 +184,9 @@ impl Render for DataTab {
                 .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                     grid::copy_selection(&this.table, cx);
                 }))
-                .child(DataTable::new(&self.table).small().stripe(true))
+                .child(DataTable::new(&self.table)
+                        .with_size(gpui_kit::component::Size::Size(super::scale(cx, 30.)))
+                        .stripe(true))
                 .into_any_element(),
         };
         v_flex()

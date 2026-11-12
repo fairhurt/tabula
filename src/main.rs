@@ -22,6 +22,7 @@ mod link;
 mod mcp;
 mod profiles;
 mod rt;
+mod settings;
 mod ui;
 
 use anyhow::bail;

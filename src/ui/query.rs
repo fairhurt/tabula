@@ -364,7 +364,7 @@ impl QueryTab {
                         .bg(theme.danger.opacity(0.08))
                         .text_color(theme.danger)
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
+                        .text_size(super::rem(12.))
                         .whitespace_normal()
                         .child(e.clone()),
                 )
@@ -402,7 +402,9 @@ impl QueryTab {
                 .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                     grid::copy_selection(&this.table, cx);
                 }))
-                .child(DataTable::new(&self.table).small().stripe(true))
+                .child(DataTable::new(&self.table)
+                        .with_size(gpui_kit::component::Size::Size(super::scale(cx, 30.)))
+                        .stripe(true))
                 .into_any_element()
         };
         let has_rows = self.results.get(self.shown).is_some_and(|r| r.has_rows());

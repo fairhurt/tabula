@@ -8,7 +8,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, ClipboardItem, Context, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div, px,
+    Window, div,
 };
 
 use crate::db::{self, ResultColumn};
@@ -86,6 +86,7 @@ impl ResultGrid {
         db::to_csv(&self.columns, &rows)
     }
 
+    /// Width in pixels at 13px text; the caller scales it.
     fn width_of(&self, col_ix: usize) -> f32 {
         let header = self.columns[col_ix].name.chars().count() + 2;
         let widest = self
@@ -115,10 +116,10 @@ impl TableDelegate for ResultGrid {
         self.order.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> Column {
+    fn column(&self, col_ix: usize, cx: &App) -> Column {
         let c = &self.columns[col_ix];
         let mut col = Column::new(SharedString::from(format!("c{col_ix}")), c.name.clone())
-            .width(px(self.width_of(col_ix)))
+            .width(super::scale(cx, self.width_of(col_ix)))
             .sortable();
         if c.is_numeric() {
             col = col.text_right();
@@ -175,7 +176,7 @@ impl TableDelegate for ResultGrid {
             .whitespace_nowrap()
             .text_ellipsis()
             .font_family(cx.theme().mono_font_family.clone())
-            .text_size(px(12.))
+            .text_size(super::rem(12.))
             .when(numeric, |d| d.text_right());
         match self.value(row_ix, col_ix) {
             None => cell

@@ -14,9 +14,11 @@ use std::sync::Arc;
 use gpui_kit::component::{Icon, Theme, ThemeMode};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    App, AppContext as _, Bounds, HeadlessAppContext, Hsla, KeyBinding, SharedString,
-    TitlebarOptions, WindowBounds, WindowOptions, point, px, rgb, size,
+    App, AppContext as _, Bounds, HeadlessAppContext, Hsla, KeyBinding, Pixels, Rems,
+    SharedString, TitlebarOptions, WindowBounds, WindowOptions, point, px, rems, rgb, size,
 };
+
+use crate::settings;
 
 pub use workspace::Workspace;
 
@@ -32,6 +34,11 @@ gpui_kit::actions!(
         NextPage,
         PrevPage,
         CopySelection,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        ToggleHistory,
+        SaveChanges,
     ]
 );
 
@@ -42,6 +49,26 @@ pub fn icon(name: &str) -> Icon {
 
 pub fn c(hex: u32) -> Hsla {
     rgb(hex).into()
+}
+
+/// A length that follows the text size: `v` is its pixel size at 13px text.
+pub fn rem(v: f32) -> Rems {
+    rems(v / 13.)
+}
+
+/// Like [`rem`], for the places that need pixels.
+pub fn scale(cx: &App, v: f32) -> Pixels {
+    use gpui_kit::component::ActiveTheme as _;
+    px(v * cx.theme().font_size.as_f32() / 13.)
+}
+
+/// Set the UI text size; rem-based sizes and the SQL editor follow it.
+pub fn set_font_size(cx: &mut App, size: f32) {
+    Theme::update(cx, |t| {
+        t.font_size = px(size);
+        t.mono_font_size = px(size - 1.);
+    });
+    cx.refresh_windows();
 }
 
 /// A key with Ctrl on Linux and Windows, Cmd on macOS.
@@ -57,11 +84,12 @@ macro_rules! key {
 
 /// Theme and key bindings: everything both the window and headless
 /// screenshots need.
-fn setup(cx: &mut App, dark: bool) {
+fn setup(cx: &mut App, dark: bool, font_size: f32) {
     gpui_kit::init(cx);
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |t| {
-        t.font_size = px(13.);
+        t.font_size = px(font_size);
+        t.mono_font_size = px(font_size - 1.);
         t.radius = px(6.);
         // A database-blue accent.
         let (primary, hover) = if dark { (0x3b82f6, 0x60a5fa) } else { (0x2563eb, 0x1d4ed8) };
@@ -84,6 +112,12 @@ fn setup(cx: &mut App, dark: bool) {
         KeyBinding::new(key!("shift-a"), ToggleAi, Some("Workspace")),
         KeyBinding::new(key!("r"), Refresh, Some("Workspace")),
         KeyBinding::new(key!("c"), CopySelection, Some("ResultGrid")),
+        KeyBinding::new(key!("h"), ToggleHistory, Some("Workspace")),
+        KeyBinding::new(key!("="), ZoomIn, Some("Workspace")),
+        KeyBinding::new(key!("+"), ZoomIn, Some("Workspace")),
+        KeyBinding::new(key!("-"), ZoomOut, Some("Workspace")),
+        KeyBinding::new(key!("0"), ZoomReset, Some("Workspace")),
+        KeyBinding::new(key!("s"), SaveChanges, Some("DataTab")),
     ]);
 }
 
@@ -95,7 +129,7 @@ pub fn run(url: Option<String>) -> anyhow::Result<()> {
                 cx.window_appearance(),
                 gpui_kit::WindowAppearance::Light | gpui_kit::WindowAppearance::VibrantLight
             );
-            setup(cx, dark);
+            setup(cx, dark, settings::load().font_size());
             let bounds = Bounds::centered(None, size(px(1400.), px(880.)), cx);
             let opened = gpui_kit::open_window(
                 WindowOptions {
@@ -130,7 +164,7 @@ pub fn screenshots(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
             Arc::new(gpui_kit::assets::AllAssets),
             gpui_kit::platform::current_headless_renderer,
         );
-        cx.update(|cx| setup(cx, dark));
+        cx.update(|cx| setup(cx, dark, settings::DEFAULT_FONT_SIZE));
         let (win, ws) = cx.update(|cx| {
             gpui_kit::open_window(
                 WindowOptions {

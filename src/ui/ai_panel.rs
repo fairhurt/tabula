@@ -16,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    Styled as _, Subscription, Window, div,
 };
 use futures::StreamExt as _;
 
@@ -222,7 +222,7 @@ impl AiPanel {
                 .justify_end()
                 .child(
                     div()
-                        .max_w(px(320.))
+                        .max_w(super::rem(320.))
                         .px_3()
                         .py_2()
                         .rounded(theme.radius_lg)

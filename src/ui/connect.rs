@@ -13,7 +13,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _, Render,
-    Styled as _, Subscription, Window, div, px,
+    Styled as _, Subscription, Window, div,
 };
 
 use super::icon;
@@ -215,7 +215,7 @@ impl Render for ConnectForm {
             AiAccess::ReadWrite => "Agents can run any statement. Use only for throwaway databases.",
         };
         v_flex()
-            .w(px(560.))
+            .w(super::rem(560.))
             .p_5()
             .gap_3()
             .bg(theme.popover)
@@ -240,7 +240,7 @@ impl Render for ConnectForm {
                 h_flex()
                     .gap_2()
                     .child(div().flex_1().child(Self::field("Host", &self.host)))
-                    .child(div().w(px(90.)).child(Self::field("Port", &self.port))),
+                    .child(div().w(super::rem(90.)).child(Self::field("Port", &self.port))),
             )
             .child(
                 h_flex()
@@ -252,7 +252,7 @@ impl Render for ConnectForm {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().w(px(70.)).text_xs().font_medium().child("SSL"))
+                    .child(div().w(super::rem(70.)).text_xs().font_medium().child("SSL"))
                     .children(ssl_buttons),
             )
             .child(
@@ -263,7 +263,7 @@ impl Render for ConnectForm {
                             .gap_2()
                             .child(
                                 h_flex()
-                                    .w(px(70.))
+                                    .w(super::rem(70.))
                                     .gap_1()
                                     .text_xs()
                                     .font_medium()
@@ -274,7 +274,7 @@ impl Render for ConnectForm {
                     )
                     .child(
                         div()
-                            .pl(px(78.))
+                            .pl(super::rem(78.))
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(ai_help),
