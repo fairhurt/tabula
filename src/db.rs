@@ -182,6 +182,34 @@ pub struct TableInfo {
     pub ddl: String,
 }
 
+/// A table or view on the schema map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapTable {
+    pub name: String,
+    pub kind: ObjectKind,
+    pub rows_estimate: Option<i64>,
+    pub columns: Vec<MapColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapColumn {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+}
+
+/// A foreign key: `from_table(from_cols)` references `to_table(to_cols)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub from_table: String,
+    pub from_cols: Vec<String>,
+    pub to_schema: String,
+    pub to_table: String,
+    pub to_cols: Vec<String>,
+}
+
 /// `"name"`, doubling any quotes inside.
 pub fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -487,6 +515,88 @@ impl Session {
             });
         }
         Ok(out)
+    }
+
+    /// Every table and view in a schema with its columns, and the foreign
+    /// keys between them: what the schema map draws.
+    pub async fn schema_map(&self, schema: &str) -> anyhow::Result<(Vec<MapTable>, Vec<ForeignKey>)> {
+        let rows = self
+            .meta
+            .query(
+                "SELECT c.relname, c.relkind::text,
+                        CASE WHEN c.reltuples >= 0 THEN c.reltuples::int8 END,
+                        a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
+                        COALESCE(a.attnum = ANY(i.indkey), false)
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                 LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
+                 WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f')
+                 ORDER BY c.relname, a.attnum",
+                &[&schema],
+            )
+            .await
+            .map_err(pg)?;
+        let mut tables: Vec<MapTable> = vec![];
+        for r in rows {
+            let name: String = r.get(0);
+            if tables.last().is_none_or(|t| t.name != name) {
+                tables.push(MapTable {
+                    name,
+                    kind: match r.get::<_, String>(1).as_str() {
+                        "v" => ObjectKind::View,
+                        "m" => ObjectKind::MaterializedView,
+                        "f" => ObjectKind::ForeignTable,
+                        _ => ObjectKind::Table,
+                    },
+                    rows_estimate: r.get(2),
+                    columns: vec![],
+                });
+            }
+            tables.last_mut().expect("just pushed").columns.push(MapColumn {
+                name: r.get(3),
+                data_type: r.get(4),
+                nullable: r.get(5),
+                primary_key: r.get(6),
+            });
+        }
+        let cols = |rel: &str, keys: &str| {
+            format!(
+                "ARRAY(SELECT a.attname::text FROM unnest(con.{keys}) WITH ORDINALITY k(attnum, ord)
+                       JOIN pg_attribute a ON a.attrelid = con.{rel} AND a.attnum = k.attnum ORDER BY k.ord)"
+            )
+        };
+        let rows = self
+            .meta
+            .query(
+                &format!(
+                    "SELECT con.conname::text, c.relname::text, fn.nspname::text, fc.relname::text, {}, {}
+                     FROM pg_constraint con
+                     JOIN pg_class c ON c.oid = con.conrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     JOIN pg_class fc ON fc.oid = con.confrelid
+                     JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+                     WHERE con.contype = 'f' AND n.nspname = $1
+                     ORDER BY c.relname, con.conname",
+                    cols("conrelid", "conkey"),
+                    cols("confrelid", "confkey")
+                ),
+                &[&schema],
+            )
+            .await
+            .map_err(pg)?;
+        let keys = rows
+            .into_iter()
+            .map(|r| ForeignKey {
+                name: r.get(0),
+                from_table: r.get(1),
+                to_schema: r.get(2),
+                to_table: r.get(3),
+                from_cols: r.get(4),
+                to_cols: r.get(5),
+            })
+            .collect();
+        Ok((tables, keys))
     }
 
     /// Columns, indexes, constraints and DDL for a table or view.
@@ -1044,6 +1154,16 @@ mod tests {
 
             let err = s.run("select * from nope", 10).await.unwrap_err();
             assert!(err.to_string().contains("42P01"), "{err}");
+
+            let (tables, keys) = s.schema_map("shop").await.unwrap();
+            let orders = tables.iter().find(|t| t.name == "orders").unwrap();
+            assert!(orders.columns.iter().any(|c| c.name == "id" && c.primary_key && !c.nullable));
+            assert!(tables.iter().any(|t| t.name == "order_totals" && t.kind == ObjectKind::View));
+            let fk = |from: &str, to: &str| keys.iter().find(|k| k.from_table == from && k.to_table == to).unwrap();
+            assert_eq!(fk("orders", "customers").from_cols, vec!["customer_id"]);
+            assert_eq!(fk("orders", "customers").to_cols, vec!["id"]);
+            assert_eq!(fk("order_items", "orders").to_schema, "shop");
+            assert_eq!(fk("order_items", "products").from_cols, vec!["product_id"]);
 
             // Row edits, on a table only this connection sees.
             s.meta

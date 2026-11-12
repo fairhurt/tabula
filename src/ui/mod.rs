@@ -3,6 +3,7 @@
 mod ai_panel;
 mod connect;
 mod data;
+mod erd;
 mod grid;
 mod history;
 mod query;
@@ -136,7 +137,7 @@ fn setup(cx: &mut App, dark: bool, font_size: f32) {
     ]);
 }
 
-pub fn run(url: Option<String>) -> anyhow::Result<()> {
+pub fn run(url: Option<String>, connect: Option<String>) -> anyhow::Result<()> {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
@@ -158,7 +159,7 @@ pub fn run(url: Option<String>) -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| Workspace::new(url.clone(), true, window, cx)),
+                |window, cx| cx.new(|cx| Workspace::new(url.clone(), connect.clone(), true, window, cx)),
             );
             if let Err(e) = opened {
                 eprintln!("couldn't open the window: {e}");
@@ -172,7 +173,7 @@ pub fn run(url: Option<String>) -> anyhow::Result<()> {
 
 /// Render the main views headless (no display needed) to PNGs, dark and
 /// light. With `url`, connect first so the views show real data.
-pub fn screenshots(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
+pub fn screenshots(dir: PathBuf, url: Option<String>, connect: Option<String>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     for dark in [true, false] {
         let mut cx = HeadlessAppContext::with_platform(
@@ -193,7 +194,7 @@ pub fn screenshots(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| Workspace::new(url.clone(), false, window, cx)),
+                |window, cx| cx.new(|cx| Workspace::new(url.clone(), connect.clone(), false, window, cx)),
             )
         })?;
         let mode = if dark { "dark" } else { "light" };
@@ -214,7 +215,7 @@ pub fn screenshots(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
         };
         settle(&mut cx)?;
         shoot(&mut cx, "start")?;
-        if url.is_none() {
+        if url.is_none() && connect.is_none() {
             continue;
         }
         for step in workspace::ShotStep::ALL {
@@ -222,7 +223,9 @@ pub fn screenshots(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
                 ws.update(cx, |w, cx| w.shot(step, window, cx))
             })?;
             settle(&mut cx)?;
-            shoot(&mut cx, step.name())?;
+            if !matches!(step, workspace::ShotStep::EditOpen) {
+                shoot(&mut cx, step.name())?;
+            }
         }
     }
     Ok(())

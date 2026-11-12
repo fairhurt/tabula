@@ -236,6 +236,23 @@ impl DataTab {
         self.load(cx);
     }
 
+    /// Stage a few edits and show their SQL (headless screenshots).
+    pub fn shot_edits(&mut self, cx: &mut Context<Self>) {
+        let col = |this: &Self, name: &str, cx: &gpui_kit::App| {
+            this.table.read(cx).delegate().columns().iter().position(|c| c.name == name)
+        };
+        let (Some(title), Some(price)) = (col(self, "title", cx), col(self, "price", cx)) else { return };
+        self.review = true;
+        self.stage(cx, |g| {
+            g.set_cell(1, price, Some("24.50".into()));
+            g.set_cell(3, title, Some("Walnut desk organiser".into()));
+            g.toggle_delete(6);
+            let new = g.add_row();
+            g.set_cell(new, title, Some("Brass pen tray".into()));
+            g.set_cell(new, price, Some("18.00".into()));
+        });
+    }
+
     // ---------------------------------------------------------------- edits
 
     fn pending(&self, cx: &gpui_kit::App) -> usize {

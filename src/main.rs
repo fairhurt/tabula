@@ -3,6 +3,7 @@
 //!
 //!   tabula                                  open the app
 //!   tabula --url postgres://…               open the app and connect
+//!   tabula --connect NAME                   open the app on a saved connection
 //!   tabula mcp [--connection NAME]          MCP server on stdio, for agents
 //!   tabula add NAME URL [--ai MODE]         save a connection (MODE: off,
 //!                                           read-only, ask, read-write)
@@ -125,19 +126,19 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some("-h" | "--help") => {
-            println!("{}", include_str!("main.rs").lines().skip(3).take(11).map(|l| l.trim_start_matches("//!")).collect::<Vec<_>>().join("\n"));
+            println!("{}", include_str!("main.rs").lines().skip(3).take(12).map(|l| l.trim_start_matches("//!")).collect::<Vec<_>>().join("\n"));
             Ok(())
         }
         _ => {
-            let url = flag("--url");
+            let (url, connect) = (flag("--url"), flag("--connect"));
             match flag("--screenshot") {
                 Some(dir) => {
-                    ui::screenshots(dir.into(), url)?;
+                    ui::screenshots(dir.into(), url, connect)?;
                     // Skip teardown: dropping the headless GPU context with
                     // the database runtime still up can crash on exit.
                     std::process::exit(0)
                 }
-                None => ui::run(url),
+                None => ui::run(url, connect),
             }
         }
     }

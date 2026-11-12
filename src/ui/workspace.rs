@@ -26,6 +26,7 @@ use gpui_kit::{
 use super::ai_panel::{AiPanel, AiPanelEvent};
 use super::connect::{ConnectEvent, ConnectForm};
 use super::data::DataTab;
+use super::erd::{ErdEvent, ErdTab};
 use super::history::{HistoryEvent, HistoryView};
 use super::query::{QueryEvent, QueryTab};
 use super::structure::{StructureTab, kind_icon};
@@ -96,6 +97,7 @@ enum Tab {
     Query(Entity<QueryTab>),
     Data(Entity<DataTab>),
     Structure(Entity<StructureTab>),
+    Erd(Entity<ErdTab>),
 }
 
 impl Tab {
@@ -104,6 +106,7 @@ impl Tab {
             Tab::Query(t) => t.read(cx).title.clone(),
             Tab::Data(t) => t.read(cx).title.clone(),
             Tab::Structure(t) => t.read(cx).title.clone(),
+            Tab::Erd(t) => t.read(cx).title.clone(),
         }
     }
 
@@ -112,6 +115,7 @@ impl Tab {
             Tab::Query(_) => "square-terminal",
             Tab::Data(_) => "table",
             Tab::Structure(_) => "table-properties",
+            Tab::Erd(_) => "orbit",
         }
     }
 
@@ -121,6 +125,7 @@ impl Tab {
             Tab::Query(t) => Some(t.read(cx).session.clone()),
             Tab::Data(t) => Some(t.read(cx).session.clone()),
             Tab::Structure(_) => None,
+            Tab::Erd(t) => Some(t.read(cx).session.clone()),
         }
     }
 
@@ -129,6 +134,7 @@ impl Tab {
             Tab::Query(t) => t.clone().into_any_element(),
             Tab::Data(t) => t.clone().into_any_element(),
             Tab::Structure(t) => t.clone().into_any_element(),
+            Tab::Erd(t) => t.clone().into_any_element(),
         }
     }
 }
@@ -163,6 +169,11 @@ pub enum ShotStep {
     Data,
     Structure,
     Query,
+    Map,
+    /// Opens a table to edit; `Edit` then stages the edits.
+    EditOpen,
+    Edit,
+    History,
     Ai,
     Connect,
     Agents,
@@ -170,11 +181,15 @@ pub enum ShotStep {
 }
 
 impl ShotStep {
-    pub const ALL: [ShotStep; 8] = [
+    pub const ALL: [ShotStep; 12] = [
         ShotStep::Tree,
         ShotStep::Data,
         ShotStep::Structure,
         ShotStep::Query,
+        ShotStep::Map,
+        ShotStep::EditOpen,
+        ShotStep::Edit,
+        ShotStep::History,
         ShotStep::Ai,
         ShotStep::Connect,
         ShotStep::Agents,
@@ -187,6 +202,10 @@ impl ShotStep {
             ShotStep::Data => "data",
             ShotStep::Structure => "structure",
             ShotStep::Query => "query",
+            ShotStep::Map => "map",
+            ShotStep::EditOpen => "edit-open",
+            ShotStep::Edit => "edit",
+            ShotStep::History => "history",
             ShotStep::Ai => "ai",
             ShotStep::Connect => "connect",
             ShotStep::Agents => "agents",
@@ -215,7 +234,14 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(url: Option<String>, live: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `url`: connect to this database. `connect`: or to this saved connection.
+    pub fn new(
+        url: Option<String>,
+        connect: Option<String>,
+        live: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let ai = cx.new(|cx| AiPanel::new(window, cx));
         let sub = cx.subscribe_in(&ai, window, |this, _, e: &AiPanelEvent, window, cx| match e {
             AiPanelEvent::Insert(sql) => this.put_sql(sql, false, window, cx),
@@ -264,6 +290,12 @@ impl Workspace {
                     auto = Some((ix, pw));
                 }
                 Err(e) => eprintln!("--url: {e}"),
+            }
+        }
+        if let Some(name) = connect {
+            match conns.iter().position(|c| c.profile.name == name) {
+                Some(ix) => auto = Some((ix, None)),
+                None => eprintln!("--connect: no saved connection named {name:?}"),
             }
         }
         let mut ws = Workspace {
@@ -613,6 +645,8 @@ impl Workspace {
                 let s = cx.subscribe(t, Self::on_tab_event);
                 self._subs.push(s);
             }
+            // `open_map` subscribes to these itself.
+            Tab::Erd(_) => {}
         }
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -744,6 +778,10 @@ impl Workspace {
 
     fn open_object(&mut self, node: Node, structure: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(o), Some(s)) = (self.object(node), self.session_for(node)) else { return };
+        self.open_table(s, o, structure, window, cx);
+    }
+
+    fn open_table(&mut self, s: Arc<Session>, o: DbObject, structure: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Reuse an open tab for the same object.
         let existing = self.tabs.iter().position(|t| match t {
             Tab::Data(d) if !structure => d.read(cx).object == o,
@@ -762,6 +800,54 @@ impl Workspace {
             let t = cx.new(|cx| DataTab::new(s, o, window, cx));
             self.add_tab(Tab::Data(t), cx);
         }
+    }
+
+    /// The schema a node belongs to, or failing that the first schema of
+    /// the user's own that is connected.
+    fn schema_for(&self, node: Option<Node>) -> Option<(Arc<Session>, String)> {
+        let first_of = |ci: usize, di: usize| -> Option<(Arc<Session>, String)> {
+            let d = self.conns.get(ci)?.dbs.get(di)?;
+            let s = d.schemas.iter().find(|s| !is_system(&s.name) && !s.objects.is_empty())
+                .or_else(|| d.schemas.iter().find(|s| !is_system(&s.name)))?;
+            Some((d.session.clone()?, s.name.clone()))
+        };
+        let from_node = node.and_then(|n| match n {
+            Node::Schema(ci, di, si) | Node::Group(ci, di, si, _) | Node::Object(ci, di, si, _) => {
+                let d = self.conns.get(ci)?.dbs.get(di)?;
+                Some((d.session.clone()?, d.schemas.get(si)?.name.clone()))
+            }
+            Node::Db(ci, di) => first_of(ci, di),
+            Node::Conn(ci) => (0..self.conns.get(ci)?.dbs.len()).find_map(|di| first_of(ci, di)),
+        });
+        from_node.or_else(|| {
+            (0..self.conns.len())
+                .flat_map(|ci| (0..self.conns[ci].dbs.len()).map(move |di| (ci, di)))
+                .find_map(|(ci, di)| first_of(ci, di))
+        })
+    }
+
+    /// Open the schema map for a node's schema.
+    fn open_map(&mut self, node: Option<Node>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((session, schema)) = self.schema_for(node) else {
+            self.status = "Connect to a database first".into();
+            cx.notify();
+            return;
+        };
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t, Tab::Erd(e) if e.read(cx).shows(&session, &schema))) {
+            self.active = i;
+            cx.notify();
+            return;
+        }
+        let tab = cx.new(|cx| ErdTab::new(session, schema, window, cx));
+        let sub = cx.subscribe_in(&tab, window, |this, tab, e: &ErdEvent, window, cx| match e {
+            ErdEvent::Open { object, structure } => {
+                let session = tab.read(cx).session.clone();
+                this.open_table(session, object.clone(), *structure, window, cx);
+            }
+            ErdEvent::AskAi(prompt) => this.ask_ai(prompt.clone(), cx),
+        });
+        self._subs.push(sub);
+        self.add_tab(Tab::Erd(tab), cx);
     }
 
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -992,7 +1078,47 @@ impl Workspace {
                     );
                 }
             }
+            ShotStep::Map => {
+                let node = find(self, "orders");
+                self.open_map(node, window, cx);
+                if let Some(Tab::Erd(t)) = self.tabs.last() {
+                    t.update(cx, |t, _| t.still());
+                }
+            }
+            ShotStep::EditOpen => {
+                if let Some(n) = find(self, "products") {
+                    self.open_object(n, false, window, cx);
+                }
+            }
+            ShotStep::Edit => {
+                if let Some(Tab::Data(t)) = self.tabs.get(self.active) {
+                    t.clone().update(cx, |t, cx| t.shot_edits(cx));
+                }
+            }
+            ShotStep::History => {
+                let entry = |at: &str, sql: &str, ms: u64, rows: Option<u64>, error: Option<&str>| crate::history::Entry {
+                    at: format!("{}T{at}:00+00:00", chrono::Local::now().format("%Y-%m-%d")),
+                    connection: "demo".into(),
+                    database: "demo".into(),
+                    sql: sql.into(),
+                    elapsed_ms: ms,
+                    rows,
+                    error: error.map(str::to_string),
+                };
+                for e in [
+                    entry("09:12", "SELECT count(*) FROM shop.customers WHERE country = 'DE';", 4, Some(1), None),
+                    entry("09:15", "SELECT c.name, count(*) AS orders\nFROM shop.orders o\nJOIN shop.customers c ON c.id = o.customer_id\nGROUP BY c.id\nORDER BY orders DESC\nLIMIT 20;", 38, Some(20), None),
+                    entry("09:21", "SELECT * FROM shop.order WHERE status = 'paid';", 2, None, Some("relation \"shop.order\" does not exist")),
+                    entry("09:22", "SELECT * FROM shop.orders WHERE status = 'paid' ORDER BY placed_at DESC LIMIT 100;", 11, Some(100), None),
+                    entry("09:40", "UPDATE shop.products SET price = price * 1.05 WHERE 'sale' = ANY(tags);", 7, Some(41), None),
+                    entry("10:02", "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM shop.orders o\nJOIN shop.order_items i ON i.order_id = o.id\nJOIN shop.products p ON p.id = i.product_id\nWHERE o.placed_at > now() - interval '30 days'\nGROUP BY o.status\nORDER BY revenue DESC;", 64, Some(4), None),
+                ] {
+                    let _ = self.history.record(e);
+                }
+                self.toggle_history(window, cx);
+            }
             ShotStep::Ai => {
+                self.modal = None;
                 self.show_ai = true;
                 self.sync_ai_target(cx);
                 self.ai.update(cx, |a, cx| a.shot_conversation(cx));
@@ -1196,6 +1322,7 @@ impl Workspace {
                     })))
             }
             Node::Schema(..) | Node::Db(..) | Node::Group(..) => menu
+                .item(act("Schema map", "orbit", Box::new(move |w, window, cx| w.open_map(Some(node), window, cx))))
                 .item(act("New query", "square-terminal", Box::new(move |w, window, cx| {
                     w.selected = Some(node);
                     w.new_query(window, cx)
@@ -1297,6 +1424,17 @@ impl Workspace {
                     .border_b_1()
                     .border_color(theme.sidebar_border)
                     .child(div().flex_1().pl_1().text_xs().font_semibold().text_color(theme.muted_foreground).child("CONNECTIONS"))
+                    .child(
+                        Button::new("open-map")
+                            .xsmall()
+                            .ghost()
+                            .icon(icon("orbit"))
+                            .tooltip("Schema map: tables and how they link")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let node = this.selected;
+                                this.open_map(node, window, cx)
+                            })),
+                    )
                     .child(
                         Button::new("add-conn")
                             .xsmall()
@@ -1456,6 +1594,17 @@ impl Workspace {
                             .icon(icon("database-plus"))
                             .label("New connection")
                             .on_click(cx.listener(|this, _, window, cx| this.open_connect(None, window, cx))),
+                    )
+                    .child(
+                        Button::new("welcome-map")
+                            .small()
+                            .outline()
+                            .icon(icon("orbit"))
+                            .label("Schema map")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let node = this.selected;
+                                this.open_map(node, window, cx)
+                            })),
                     )
                     .child(
                         Button::new("welcome-agents")

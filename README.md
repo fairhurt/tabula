@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/icon.png" width="112" alt="Tabula's icon: a table whose first cell is a ringed planet">
+
 # Tabula
 
 **A fast, native PostgreSQL client — that your AI agents can use too.**
@@ -58,6 +60,8 @@ Agents get read-only access, enforced by PostgreSQL itself. Writes can wait for 
 
 Page through 500 rows at a time, filter with any `WHERE` clause, and click a header to sort on the server. NULLs look like NULLs, numbers line up on the right, and the grid stays smooth on big tables.
 
+Tables with a primary key can be edited in place. Double-click a cell (or press <kbd>F2</kbd>) to change it, **+ Row** to add one, right-click for **Set to NULL**, **Duplicate row** and **Delete row**. Nothing touches the database until you press **Save** (<kbd>Ctrl</kbd>+<kbd>S</kbd>): edits are highlighted, **Review SQL** shows exactly what will run, and everything is applied in one transaction, so either all of it is saved or none of it. An update or delete that no longer matches exactly one row stops the save.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/data-dark.png">
   <img src="docs/data-light.png" alt="The Data tab browsing shop.orders">
@@ -72,6 +76,14 @@ Columns with types, defaults and keys; indexes; constraints including foreign ke
   <img src="docs/structure-light.png" alt="The Structure tab for shop.orders">
 </picture>
 
+## 🪐 Schema map
+
+Right-click a schema and pick **Schema map** (or use the orbit button above the tree) to see every table as a card with its columns and keys, and every foreign key as a link from the column that holds it to the column it references. A small physics simulation lays it out: linked tables pull together, all tables push apart, and when you drag one its neighbours follow. Drag the background to pan, scroll to zoom, double-click a table for its rows, and search to fly to a table. Tables you drag stay pinned; **Lay out again** frees them. In the dark theme the map sits on a starfield; in the light theme on a dotted grid.
+
+## 🕘 Query history
+
+Every statement you run from a query tab is remembered, with when it ran, how long it took and whether it failed. <kbd>Ctrl</kbd>+<kbd>H</kbd> opens the history: type to search, <kbd>Enter</kbd> puts a query back in the editor, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs it again. It is kept in `tabula/history.jsonl` beside your connections (the latest 1,000).
+
 ## 🤖 Ask AI
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>. The agent looks things up with Tabula's tools (you see each call) before it answers. Query tabs add **Explain**, **Optimize** and, after an error, **Fix with AI**. <kbd>Ctrl</kbd>+<kbd>K</kbd> in the editor jumps straight to the panel.
@@ -80,6 +92,8 @@ Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>. The agent looks things up w
   <source media="(prefers-color-scheme: dark)" srcset="docs/ai-dark.png">
   <img src="docs/ai-light.png" alt="The Ask AI panel answering with a SQL block and Insert / Run buttons">
 </picture>
+
+Pick the model from the menu beside the agent buttons: the agent's own default, a listed model, or any id you type. The choice is remembered per agent.
 
 No API keys: Tabula runs `claude -p` or `copilot -p` headless, signed in as you, with **only Tabula's tools** for that run — no shell, no file edits, no other MCP servers, no hooks.
 
@@ -144,6 +158,10 @@ Set per connection, in the connection dialog:
 | <kbd>Ctrl</kbd>+<kbd>K</kbd> | Ask AI from the editor |
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> | Refresh the object tree |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> | Copy the selected cell, row or column |
+| <kbd>Ctrl</kbd>+<kbd>H</kbd> | Query history |
+| <kbd>F2</kbd> / double-click | Edit a cell in a Data tab |
+| <kbd>Ctrl</kbd>+<kbd>S</kbd> | Save a Data tab's edits |
+| <kbd>Ctrl</kbd>+<kbd>=</kbd> / <kbd>Ctrl</kbd>+<kbd>-</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | Larger text, smaller text, reset |
 
 On macOS, use <kbd>Cmd</kbd> instead of <kbd>Ctrl</kbd>.
 
@@ -152,11 +170,12 @@ On macOS, use <kbd>Cmd</kbd> instead of <kbd>Ctrl</kbd>.
 ```text
 tabula                                  open the app
 tabula --url postgres://…               open the app and connect
+tabula --connect NAME                   open the app on a saved connection
 tabula add NAME URL [--ai MODE]         save a connection (off, read-only, ask, read-write)
 tabula agents [connect|disconnect]      register `tabula mcp` with Claude Code and Copilot CLI
 tabula mcp [--connection NAME]          the MCP server (agents start this)
-tabula ask CONNECTION "question"        ask an agent from the terminal [--copilot]
-tabula --screenshot DIR [--url …]       render the views headless to PNGs
+tabula ask CONNECTION "question"        ask an agent from the terminal [--copilot] [--model M]
+tabula --screenshot DIR [--url …]       render the views headless to PNGs (macOS and Linux)
 ```
 
 Or register by hand: `claude mcp add tabula -- /path/to/tabula mcp`.
@@ -176,7 +195,9 @@ On Linux, GPUI needs Vulkan and the fontconfig, xkbcommon and OpenSSL dev packag
 sudo apt install libfontconfig-dev libxkbcommon-x11-dev libssl-dev
 ```
 
-Saved connections live in your config folder (`tabula/connections.json`). Passwords go in the OS credential store on Windows and macOS, and in a file only you can read on Linux.
+The app icon is drawn in `assets/icon.svg`; the build renders it and, on Windows, embeds it in the executable.
+
+Saved connections live in your config folder (`tabula/connections.json`), next to `settings.json` (text size, Ask AI agent and model) and `history.jsonl`. Passwords go in the OS credential store on Windows and macOS, and in a file only you can read on Linux.
 
 ## 🐘 Demo database
 
@@ -198,4 +219,4 @@ TABULA_TEST_URL=postgres://postgres:tabula@localhost/postgres cargo test
 cargo run -- --screenshot shots --url postgres://postgres:tabula@localhost/postgres
 ```
 
-Database and MCP tests skip without `TABULA_TEST_URL`. The screenshots above come from `--screenshot` against `scripts/seed.sql`.
+Database and MCP tests skip without `TABULA_TEST_URL`. `TABULA_TEST_CONNECTION=name` runs the database test on a saved connection instead, taking its password from the credential store. The screenshots above come from `--screenshot` against `scripts/seed.sql`; headless rendering needs macOS or Linux.
