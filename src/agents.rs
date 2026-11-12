@@ -67,18 +67,6 @@ impl Agent {
         }
     }
 
-    /// What to show for a `--model` value.
-    pub fn model_label(self, model: Option<&str>) -> String {
-        match model {
-            None => "Default".into(),
-            Some(m) => self
-                .models()
-                .iter()
-                .find(|(_, id)| *id == m)
-                .map_or_else(|| m.to_string(), |(label, _)| label.to_string()),
-        }
-    }
-
     pub fn command(self) -> &'static str {
         match self {
             Agent::Claude => "claude",

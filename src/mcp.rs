@@ -468,6 +468,19 @@ fn strip_nulls(v: Value) -> Value {
     }
 }
 
+/// The tools this server offers, by name. Kept in step with `tool_specs`
+/// by a test.
+pub const TOOL_NAMES: [&str; 8] = [
+    "list_connections",
+    "list_schemas",
+    "list_tables",
+    "describe_table",
+    "sample_rows",
+    "run_query",
+    "explain_query",
+    "open_in_tabula",
+];
+
 fn tool_specs() -> Value {
     let conn = json!({"type": "string", "description": "Connection name from list_connections. Optional when there is only one."});
     json!([
@@ -574,6 +587,13 @@ mod tests {
             r["result"]["content"][0]["text"].as_str().unwrap().to_string(),
             r["result"]["isError"].as_bool().unwrap(),
         )
+    }
+
+    #[test]
+    fn tool_names_match_the_specs() {
+        let specs = tool_specs();
+        let names: Vec<&str> = specs.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, TOOL_NAMES);
     }
 
     #[test]

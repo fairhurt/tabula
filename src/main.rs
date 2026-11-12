@@ -18,6 +18,7 @@
 
 mod agents;
 mod ai;
+mod copilot;
 mod db;
 mod history;
 mod link;

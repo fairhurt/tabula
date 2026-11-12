@@ -95,7 +95,7 @@ Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>. The agent looks things up w
 
 Pick the model from the menu beside the agent buttons: the agent's own default, a listed model, or any id you type. The choice is remembered per agent.
 
-No API keys: Tabula runs `claude -p` or `copilot -p` headless, signed in as you, with **only Tabula's tools** for that run — no shell, no file edits, no other MCP servers, no hooks.
+No API keys: both agents run signed in as you, with **only Tabula's tools** — no shell, no file edits, no other MCP servers. Claude Code runs headless with `claude -p`. Copilot runs through [GitHub's Copilot SDK](https://github.com/github/copilot-sdk): Tabula keeps one Copilot CLI server for the life of the app, so a conversation stays in one session, text streams as it is written, you see each tool call, and the model menu lists what your account offers. If the installed Copilot CLI is too old for the SDK, Tabula falls back to `copilot -p`.
 
 ## 🔌 Let your agents use Tabula
 
@@ -218,5 +218,7 @@ docker exec -i tabula-pg psql -U postgres < scripts/seed.sql
 TABULA_TEST_URL=postgres://postgres:tabula@localhost/postgres cargo test
 cargo run -- --screenshot shots --url postgres://postgres:tabula@localhost/postgres
 ```
+
+`cargo test -- --ignored copilot` asks a signed-in Copilot for its model list, and `TABULA_AI_DEBUG=1 tabula ask NAME "question" --copilot` prints every event the SDK sends.
 
 Database and MCP tests skip without `TABULA_TEST_URL`. `TABULA_TEST_CONNECTION=name` runs the database test on a saved connection instead, taking its password from the credential store. The screenshots above come from `--screenshot` against `scripts/seed.sql`; headless rendering needs macOS or Linux.

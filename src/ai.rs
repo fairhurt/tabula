@@ -47,17 +47,30 @@ pub struct AskRequest {
 #[derive(Clone)]
 pub struct Run {
     child: Arc<Mutex<Option<Child>>>,
+    /// Told to stop, for runs that aren't a child process (Copilot's SDK).
+    abort: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Run {
+    /// A run that stops when `abort` is notified.
+    pub fn aborting(abort: Arc<tokio::sync::Notify>) -> Run {
+        Run {
+            child: Arc::new(Mutex::new(None)),
+            abort: Some(abort),
+        }
+    }
+
     pub fn stop(&self) {
         if let Some(mut c) = self.child.lock().expect("child lock").take() {
             let _ = c.kill();
         }
+        if let Some(a) = &self.abort {
+            a.notify_one();
+        }
     }
 }
 
-fn system_prompt(req: &AskRequest) -> String {
+pub(crate) fn system_prompt(req: &AskRequest) -> String {
     format!(
         "You are the AI assistant inside Tabula, a PostgreSQL client. The user is working on the connection \"{conn}\" (database \"{db}\"). \
 Use the `tabula` MCP tools to look at the real schema and data before answering: list_tables, describe_table, sample_rows, run_query, explain_query. \
@@ -69,7 +82,7 @@ Be concise. Don't modify data unless the user explicitly asks.",
     )
 }
 
-fn scratch_dir() -> PathBuf {
+pub(crate) fn scratch_dir() -> PathBuf {
     let d = std::env::temp_dir().join(format!("tabula-ai-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&d);
     d
@@ -159,10 +172,20 @@ pub fn plan(req: &AskRequest, files: &std::path::Path) -> (Vec<String>, Option<S
 }
 
 /// Start a run. Events arrive on the returned channel, ending with `Done`.
+/// Copilot runs through its SDK; Claude Code through its command line.
 pub fn ask(req: AskRequest) -> (futures::channel::mpsc::UnboundedReceiver<AiEvent>, Run) {
+    match req.agent {
+        Agent::Copilot => crate::copilot::ask(req),
+        Agent::Claude => ask_cli(req),
+    }
+}
+
+/// Run the agent's command line once for this question.
+pub(crate) fn ask_cli(req: AskRequest) -> (futures::channel::mpsc::UnboundedReceiver<AiEvent>, Run) {
     let (tx, rx) = futures::channel::mpsc::unbounded();
     let run = Run {
         child: Arc::new(Mutex::new(None)),
+        abort: None,
     };
     let files = scratch_dir();
     let (args, stdin, writes) = plan(&req, &files);

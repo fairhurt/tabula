@@ -50,7 +50,7 @@ pub struct AiPanel {
     messages: Vec<Msg>,
     input: Entity<InputState>,
     run: Option<Run>,
-    /// Claude Code session, to continue the conversation.
+    /// The agent's session, to continue the conversation.
     session: Option<String>,
     scroll: ScrollHandle,
     /// The model picked for each agent, by [`Agent::key`]. Absent: its default.
@@ -59,6 +59,9 @@ pub struct AiPanel {
     custom_model: Entity<InputState>,
     /// The agent a model id is being typed for.
     typing_model: Option<Agent>,
+    /// The models Copilot offers this account, as (name, id), once asked for.
+    copilot_models: Vec<(String, String)>,
+    asked_for_models: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -103,6 +106,8 @@ impl AiPanel {
             models: HashMap::new(),
             custom_model,
             typing_model: None,
+            copilot_models: vec![],
+            asked_for_models: false,
             _subs: vec![sub, sub2],
         }
     }
@@ -124,6 +129,40 @@ impl AiPanel {
 
     fn model(&self) -> Option<&str> {
         self.models.get(self.agent.key()).map(String::as_str)
+    }
+
+    /// Ask Copilot which models this account can use, once. It starts the
+    /// Copilot server, so it waits until the panel is actually shown.
+    fn load_copilot_models(&mut self, cx: &mut Context<Self>) {
+        if self.asked_for_models || !self.installed.contains(&Agent::Copilot) {
+            return;
+        }
+        self.asked_for_models = true;
+        let fut = crate::rt::spawn(crate::copilot::models());
+        cx.spawn(async move |this, cx| {
+            // On failure the short built-in list stays.
+            if let Ok(models) = fut.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.copilot_models = models;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The models to offer for `agent`, as (label, id).
+    fn models_of(&self, agent: Agent) -> Vec<(String, String)> {
+        let mut list: Vec<(String, String)> =
+            agent.models().iter().map(|(l, id)| (l.to_string(), id.to_string())).collect();
+        if agent == Agent::Copilot {
+            for (name, id) in &self.copilot_models {
+                if !list.iter().any(|(_, known)| known == id) {
+                    list.push((name.clone(), id.clone()));
+                }
+            }
+        }
+        list
     }
 
     /// Use `agent` with `model` (`None` is the agent's own default). The
@@ -392,9 +431,20 @@ impl AiPanel {
 impl Render for AiPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        self.load_copilot_models(cx);
         let agent = self.agent;
         let current = self.model().map(str::to_string);
         let running = self.run.is_some();
+        let offered: Vec<(Agent, Vec<(String, String)>)> =
+            Agent::ALL.into_iter().map(|a| (a, self.models_of(a))).collect();
+        let current_label = match &current {
+            None => "Default".to_string(),
+            Some(id) => offered
+                .iter()
+                .find(|(a, _)| *a == agent)
+                .and_then(|(_, list)| list.iter().find(|(_, known)| known == id))
+                .map_or_else(|| id.clone(), |(label, _)| label.clone()),
+        };
         let picker = {
             let weak = cx.entity().downgrade();
             let installed = self.installed.clone();
@@ -404,12 +454,13 @@ impl Render for AiPanel {
                 .ghost()
                 .rounded(ButtonRounded::Large)
                 .icon(icon(agent_icon(agent)))
-                .label(format!("{} · {}", agent.short_label(), agent.model_label(current.as_deref())))
+                .label(format!("{} · {current_label}", agent.short_label()))
                 .tooltip("Choose the agent and model")
                 .disabled(running)
                 // Opens upwards: the prompt box sits at the bottom of the panel.
                 .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, move |mut menu, _, _| {
-                    for (n, a) in Agent::ALL.into_iter().enumerate() {
+                    for (n, (a, list)) in offered.iter().enumerate() {
+                        let a = *a;
                         let ready = installed.contains(&a);
                         let chosen = models.get(a.key()).cloned();
                         if n > 0 {
@@ -431,11 +482,11 @@ impl Render for AiPanel {
                                 })
                         };
                         menu = menu.item(pick("Default".into(), None));
-                        for (label, id) in a.models() {
-                            menu = menu.item(pick(label.to_string(), Some(id.to_string())));
+                        for (label, id) in list {
+                            menu = menu.item(pick(label.clone(), Some(id.clone())));
                         }
                         // A typed id that isn't in the list stays visible.
-                        if let Some(c) = chosen.clone().filter(|c| !a.models().iter().any(|(_, id)| id == c)) {
+                        if let Some(c) = chosen.clone().filter(|c| !list.iter().any(|(_, id)| id == c)) {
                             menu = menu.item(pick(c.clone(), Some(c)));
                         }
                         let weak = weak.clone();
