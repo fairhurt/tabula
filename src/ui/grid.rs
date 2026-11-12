@@ -67,6 +67,9 @@ pub struct ResultGrid {
     edits: Option<Edits>,
     /// The cell being edited, as displayed.
     pub editing: Option<(usize, usize)>,
+    /// The cell the context menu was opened on. The table forgets its own
+    /// record of it before a menu item is clicked, so the tabs note it here.
+    pub menu_cell: Option<(usize, usize)>,
     pub request: Option<GridRequest>,
 }
 
@@ -81,6 +84,7 @@ impl ResultGrid {
             loading: false,
             edits: None,
             editing: None,
+            menu_cell: None,
             request: None,
         }
     }
@@ -292,6 +296,17 @@ impl ResultGrid {
     }
 }
 
+/// The column of the cell a row's context menu was opened on.
+fn menu_column(table: &TableState<ResultGrid>, row_ix: usize) -> Option<usize> {
+    table
+        .delegate()
+        .menu_cell
+        .or(table.right_clicked_cell())
+        .or(table.selected_cell())
+        .filter(|(r, _)| *r == row_ix)
+        .map(|(_, c)| c)
+}
+
 /// A cell's whole value, opened from the grid to read or copy.
 pub struct CellValue {
     pub column: String,
@@ -338,7 +353,7 @@ pub fn value_viewer(
     value: &CellValue,
     close: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
-) -> impl IntoElement {
+) -> gpui_kit::AnyElement {
     use gpui_kit::StatefulInteractiveElement as _;
     use gpui_kit::component::button::{Button, ButtonVariants as _};
     use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
@@ -408,6 +423,7 @@ pub fn value_viewer(
                         }),
                 ),
         )
+        .into_any_element()
 }
 
 /// Copy the grid's selection (or all of it) to the clipboard.
@@ -493,8 +509,8 @@ impl TableDelegate for ResultGrid {
             let table = table.clone();
             PopupMenuItem::new("View value").icon(icon("maximize-2")).on_click(move |_, _, cx| {
                 let _ = table.update(cx, |t, cx| {
-                    let cell = t.right_clicked_cell().or(t.selected_cell()).filter(|(r, _)| *r == row_ix);
-                    t.delegate_mut().request = cell.map(|(r, c)| GridRequest::View(r, c));
+                    let col = menu_column(t, row_ix).unwrap_or(0);
+                    t.delegate_mut().request = Some(GridRequest::View(row_ix, col));
                     cx.notify();
                 });
             })
@@ -508,8 +524,7 @@ impl TableDelegate for ResultGrid {
             let table = table.clone();
             PopupMenuItem::new(label.to_string()).icon(icon(ic)).on_click(move |_, _, cx| {
                 let _ = table.update(cx, |t, cx| {
-                    // The cell that was right-clicked, when it is on this row.
-                    let col = t.right_clicked_cell().filter(|(r, _)| *r == row_ix).map(|(_, c)| c);
+                    let col = menu_column(t, row_ix);
                     t.delegate_mut().request = make(row_ix, col);
                     cx.notify();
                 });

@@ -123,8 +123,13 @@ impl DataTab {
                 }
             }),
             cx.subscribe_in(&table, window, |this, _, e: &TableEvent, window, cx| {
-                if let TableEvent::DoubleClickedCell(r, c) = e {
-                    this.start_edit(*r, *c, window, cx);
+                match e {
+                    TableEvent::DoubleClickedCell(r, c) => this.start_edit(*r, *c, window, cx),
+                    TableEvent::RightClickedCell(r, c) => {
+                        let cell = Some((*r, *c));
+                        this.table.update(cx, |t, _| t.delegate_mut().menu_cell = cell);
+                    }
+                    _ => {}
                 }
             }),
             cx.subscribe(&cell_input, |this, _, e: &InputEvent, cx| match e {
@@ -556,10 +561,8 @@ impl Render for DataTab {
                 cx,
             )
         });
-        v_flex()
+        let content = v_flex()
             .size_full()
-            .relative()
-            .children(viewer)
             .key_context("DataTab")
             .on_action(cx.listener(|this, _: &SaveChanges, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &EditCell, window, cx| {
@@ -680,6 +683,8 @@ impl Render for DataTab {
                             .disabled(self.rows_on_page < PAGE || self.loading)
                             .on_click(cx.listener(|this, _, _, cx| this.go(1, cx))),
                     ),
-            )
+            );
+        // Last, so it is drawn over everything else in the tab.
+        div().size_full().relative().child(content).children(viewer)
     }
 }

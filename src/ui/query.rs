@@ -90,9 +90,17 @@ impl QueryTab {
         let subs = vec![
             // Double-click a cell, or "View value" in its menu, to read all of it.
             cx.subscribe(&table, |this, table, e: &gpui_kit::component::table::TableEvent, cx| {
-                if let gpui_kit::component::table::TableEvent::DoubleClickedCell(r, c) = e {
-                    this.viewing = table.read(cx).delegate().cell_value(*r, *c);
-                    cx.notify();
+                use gpui_kit::component::table::TableEvent;
+                match e {
+                    TableEvent::DoubleClickedCell(r, c) => {
+                        this.viewing = table.read(cx).delegate().cell_value(*r, *c);
+                        cx.notify();
+                    }
+                    TableEvent::RightClickedCell(r, c) => {
+                        let cell = Some((*r, *c));
+                        table.update(cx, |t, _| t.delegate_mut().menu_cell = cell);
+                    }
+                    _ => {}
                 }
             }),
             cx.observe(&table, |this, table, cx| {
@@ -547,10 +555,8 @@ impl Render for QueryTab {
                 cx,
             )
         });
-        v_flex()
+        let content = v_flex()
             .size_full()
-            .relative()
-            .children(viewer)
             .key_context("QueryTab")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run(cx)))
@@ -565,7 +571,8 @@ impl Render for QueryTab {
                             .child(Editor::new(&self.editor).h_full().bordered(false)),
                     )
                     .child(resizable_panel().child(self.render_results(cx))),
-            )
+            );
+        // Last, so it is drawn over everything else in the tab.
+        div().size_full().relative().child(content).children(viewer)
     }
 }
-
