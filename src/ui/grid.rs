@@ -1,17 +1,54 @@
 //! The results grid shared by the Query and Data tabs: virtualized rows,
-//! resizable columns, sorting, NULLs drawn as NULL, copy as TSV.
+//! resizable columns, sorting, NULLs drawn as NULL, copy as TSV. In the
+//! Data tab it also holds edits that haven't been saved yet.
+
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::component::{
-    ActiveTheme as _,
+    ActiveTheme as _, Sizable as _,
+    input::{Escape, Input, InputState},
+    menu::{PopupMenu, PopupMenuItem},
     table::{Column, ColumnSort, TableDelegate, TableSelection, TableState},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, ClipboardItem, Context, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div,
+    App, ClipboardItem, Context, Div, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, Stateful, Styled as _, Window, div,
 };
 
-use crate::db::{self, ResultColumn};
+use super::icon;
+use crate::db::{self, Change, ResultColumn};
+
+/// Something the user asked for from a cell's right-click menu; the Data tab
+/// picks it up. Rows and columns are as displayed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridRequest {
+    Edit(usize, usize),
+    SetNull(usize, usize),
+    ToggleDelete(usize),
+    Duplicate(usize),
+}
+
+/// Unsaved edits to the rows on screen.
+struct Edits {
+    /// Primary key columns, by name; resolved to indexes when rows load.
+    key_names: Vec<String>,
+    key: Vec<usize>,
+    /// New values by (row, column), rows as stored (not as displayed).
+    edited: HashMap<(usize, usize), Option<String>>,
+    deleted: HashSet<usize>,
+    /// Rows that came from the server; any after them are new.
+    loaded: usize,
+    /// The input a cell turns into while it's edited.
+    editor: Entity<InputState>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RowState {
+    Clean,
+    New,
+    Deleted,
+}
 
 /// Longest text drawn in a cell; the whole value is still copied.
 const CELL_CHARS: usize = 300;
@@ -25,6 +62,10 @@ pub struct ResultGrid {
     server_sort: bool,
     pub sort_request: Option<(usize, bool)>,
     loading: bool,
+    edits: Option<Edits>,
+    /// The cell being edited, as displayed.
+    pub editing: Option<(usize, usize)>,
+    pub request: Option<GridRequest>,
 }
 
 impl ResultGrid {
@@ -36,6 +77,9 @@ impl ResultGrid {
             server_sort,
             sort_request: None,
             loading: false,
+            edits: None,
+            editing: None,
+            request: None,
         }
     }
 
@@ -44,6 +88,149 @@ impl ResultGrid {
         self.columns = columns;
         self.rows = rows;
         self.loading = false;
+        self.editing = None;
+        if let Some(e) = &mut self.edits {
+            e.edited.clear();
+            e.deleted.clear();
+            e.loaded = self.rows.len();
+            e.key = e
+                .key_names
+                .iter()
+                .filter_map(|k| self.columns.iter().position(|c| &c.name == k))
+                .collect();
+        }
+    }
+
+    // ---------------------------------------------------------------- edits
+
+    /// Let rows be edited; `key` is the table's primary key.
+    pub fn enable_editing(&mut self, key: Vec<String>, editor: Entity<InputState>) {
+        self.edits = Some(Edits {
+            key: key.iter().filter_map(|k| self.columns.iter().position(|c| &c.name == k)).collect(),
+            key_names: key,
+            edited: HashMap::new(),
+            deleted: HashSet::new(),
+            loaded: self.rows.len(),
+            editor,
+        });
+    }
+
+    /// Rows can be edited: there is a primary key and every part of it is
+    /// among the columns.
+    pub fn editable(&self) -> bool {
+        self.edits.as_ref().is_some_and(|e| !e.key_names.is_empty() && e.key.len() == e.key_names.len())
+    }
+
+    fn row_state(&self, row_ix: usize) -> RowState {
+        match (&self.edits, self.order.get(row_ix)) {
+            (Some(e), Some(r)) if e.deleted.contains(r) => RowState::Deleted,
+            (Some(e), Some(r)) if *r >= e.loaded => RowState::New,
+            _ => RowState::Clean,
+        }
+    }
+
+    fn is_edited(&self, row_ix: usize, col_ix: usize) -> bool {
+        match (&self.edits, self.order.get(row_ix)) {
+            (Some(e), Some(r)) => e.edited.contains_key(&(*r, col_ix)),
+            _ => false,
+        }
+    }
+
+    /// The value shown in a cell, with unsaved edits applied.
+    pub fn shown(&self, row_ix: usize, col_ix: usize) -> Option<&str> {
+        self.value(row_ix, col_ix)
+    }
+
+    /// Stage a new value for a cell. Putting the saved value back unstages it.
+    pub fn set_cell(&mut self, row_ix: usize, col_ix: usize, value: Option<String>) {
+        let Some(&r) = self.order.get(row_ix) else { return };
+        let saved = self.rows.get(r).and_then(|row| row.get(col_ix)).cloned();
+        let Some(e) = &mut self.edits else { return };
+        if r < e.loaded && saved == Some(value.clone()) {
+            e.edited.remove(&(r, col_ix));
+        } else {
+            e.edited.insert((r, col_ix), value);
+        }
+    }
+
+    /// Add an empty row at the end; returns where it is displayed.
+    pub fn add_row(&mut self) -> usize {
+        self.rows.push(vec![None; self.columns.len()]);
+        self.order.push(self.rows.len() - 1);
+        self.order.len() - 1
+    }
+
+    /// Add a row with this row's values, leaving the key to its default.
+    pub fn duplicate_row(&mut self, row_ix: usize) -> usize {
+        let values: Vec<Option<String>> =
+            (0..self.columns.len()).map(|c| self.value(row_ix, c).map(str::to_string)).collect();
+        let new = self.add_row();
+        let r = self.order[new];
+        if let Some(e) = &mut self.edits {
+            for (c, v) in values.into_iter().enumerate() {
+                if !e.key.contains(&c) && v.is_some() {
+                    e.edited.insert((r, c), v);
+                }
+            }
+        }
+        new
+    }
+
+    /// Mark a row for deletion, or take the mark off.
+    pub fn toggle_delete(&mut self, row_ix: usize) {
+        let Some(&r) = self.order.get(row_ix) else { return };
+        if let Some(e) = &mut self.edits {
+            if !e.deleted.remove(&r) {
+                e.deleted.insert(r);
+            }
+        }
+    }
+
+    pub fn is_deleted(&self, row_ix: usize) -> bool {
+        self.row_state(row_ix) == RowState::Deleted
+    }
+
+    /// Drop every unsaved edit.
+    pub fn discard(&mut self) {
+        self.editing = None;
+        if let Some(e) = &mut self.edits {
+            e.edited.clear();
+            e.deleted.clear();
+            self.rows.truncate(e.loaded);
+            self.order.retain(|r| *r < e.loaded);
+        }
+    }
+
+    /// The unsaved edits as changes to apply: deletes, then updates, then
+    /// new rows.
+    pub fn changes(&self) -> Vec<Change> {
+        let Some(e) = &self.edits else { return vec![] };
+        let name = |c: usize| self.columns[c].name.clone();
+        let key = |r: usize| -> Vec<db::Cell> { e.key.iter().map(|&c| (name(c), self.rows[r][c].clone())).collect() };
+        let set = |r: usize| -> Vec<db::Cell> {
+            let mut cells: Vec<(usize, Option<String>)> =
+                e.edited.iter().filter(|((row, _), _)| *row == r).map(|((_, c), v)| (*c, v.clone())).collect();
+            cells.sort_by_key(|(c, _)| *c);
+            cells.into_iter().map(|(c, v)| (name(c), v)).collect()
+        };
+        let mut out = vec![];
+        let mut deleted: Vec<usize> = e.deleted.iter().copied().filter(|r| *r < e.loaded).collect();
+        deleted.sort();
+        out.extend(deleted.into_iter().map(|r| Change::Delete { key: key(r) }));
+        for r in 0..e.loaded {
+            if !e.deleted.contains(&r) {
+                let set = set(r);
+                if !set.is_empty() {
+                    out.push(Change::Update { key: key(r), set });
+                }
+            }
+        }
+        for r in e.loaded..self.rows.len() {
+            if !e.deleted.contains(&r) {
+                out.push(Change::Insert { values: set(r) });
+            }
+        }
+        out
     }
 
     pub fn set_loading(&mut self, loading: bool) {
@@ -57,6 +244,9 @@ impl ResultGrid {
 
     fn value(&self, row_ix: usize, col_ix: usize) -> Option<&str> {
         let r = *self.order.get(row_ix)?;
+        if let Some(v) = self.edits.as_ref().and_then(|e| e.edited.get(&(r, col_ix))) {
+            return v.as_deref();
+        }
         self.rows.get(r)?.get(col_ix)?.as_deref()
     }
 
@@ -162,6 +352,53 @@ impl TableDelegate for ResultGrid {
         }
     }
 
+    fn render_tr(&mut self, row_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
+        let row = div().id(("row", row_ix));
+        match self.row_state(row_ix) {
+            RowState::Clean => row,
+            RowState::New => row.bg(cx.theme().success.opacity(0.12)),
+            RowState::Deleted => row.bg(cx.theme().danger.opacity(0.12)),
+        }
+    }
+
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        if !self.editable() {
+            return menu;
+        }
+        let table = cx.entity().downgrade();
+        let deleted = self.is_deleted(row_ix);
+        let item = |label: &str, ic: &str, make: fn(usize, Option<usize>) -> Option<GridRequest>| {
+            let table = table.clone();
+            PopupMenuItem::new(label.to_string()).icon(icon(ic)).on_click(move |_, _, cx| {
+                let _ = table.update(cx, |t, cx| {
+                    // The cell that was right-clicked, when it is on this row.
+                    let col = t.right_clicked_cell().filter(|(r, _)| *r == row_ix).map(|(_, c)| c);
+                    t.delegate_mut().request = make(row_ix, col);
+                    cx.notify();
+                });
+            })
+        };
+        let mut menu = menu;
+        if !deleted {
+            menu = menu
+                .item(item("Edit cell", "square-pen", |r, c| c.map(|c| GridRequest::Edit(r, c))))
+                .item(item("Set to NULL", "circle-slash", |r, c| c.map(|c| GridRequest::SetNull(r, c))))
+                .separator()
+                .item(item("Duplicate row", "copy-plus", |r, _| Some(GridRequest::Duplicate(r))));
+        }
+        menu.item(item(
+            if deleted { "Keep row" } else { "Delete row" },
+            if deleted { "undo-2" } else { "trash-2" },
+            |r, _| Some(GridRequest::ToggleDelete(r)),
+        ))
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -169,26 +406,52 @@ impl TableDelegate for ResultGrid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        if self.editing == Some((row_ix, col_ix)) {
+            if let Some(e) = &self.edits {
+                return div()
+                    .w_full()
+                    .on_action(cx.listener(|t, _: &Escape, _, cx| {
+                        t.delegate_mut().editing = None;
+                        cx.notify();
+                    }))
+                    .child(Input::new(&e.editor).xsmall().appearance(false))
+                    .into_any_element();
+            }
+        }
+        let theme = cx.theme();
         let numeric = self.columns.get(col_ix).is_some_and(|c| c.is_numeric());
+        let state = self.row_state(row_ix);
+        let edited = self.is_edited(row_ix, col_ix);
         let cell = div()
             .w_full()
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
-            .font_family(cx.theme().mono_font_family.clone())
+            .font_family(theme.mono_font_family.clone())
             .text_size(super::rem(12.))
-            .when(numeric, |d| d.text_right());
+            .when(numeric, |d| d.text_right())
+            .when(state == RowState::Deleted, |d| d.line_through().text_color(theme.muted_foreground))
+            .when(edited && state != RowState::Deleted, |d| {
+                d.px_1().rounded_sm().bg(theme.warning.opacity(0.28))
+            });
         match self.value(row_ix, col_ix) {
+            // A new row's untouched cells take the column default.
+            None if state == RowState::New && !edited => cell
+                .italic()
+                .text_color(theme.muted_foreground.opacity(0.5))
+                .child("default")
+                .into_any_element(),
             None => cell
                 .italic()
-                .text_color(cx.theme().muted_foreground.opacity(0.7))
-                .child("NULL"),
+                .text_color(theme.muted_foreground.opacity(0.7))
+                .child("NULL")
+                .into_any_element(),
             Some(v) => {
                 let mut s: String = v.chars().take(CELL_CHARS).collect();
                 if s.contains(['\n', '\r', '\t']) {
                     s = s.replace(['\n', '\r', '\t'], " ");
                 }
-                cell.child(s)
+                cell.child(s).into_any_element()
             }
         }
     }

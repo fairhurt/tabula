@@ -188,6 +188,113 @@ pub fn quote_ident(s: &str) -> String {
 }
 
 
+/// `'text'`, doubling any quotes inside.
+pub fn quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A column name and its value as text (`None` is NULL).
+pub type Cell = (String, Option<String>);
+
+/// One edit to a table's rows, made in the Data tab.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Set columns on the row with this primary key.
+    Update { key: Vec<Cell>, set: Vec<Cell> },
+    /// A new row; columns left out take their defaults.
+    Insert { values: Vec<Cell> },
+    /// Delete the row with this primary key.
+    Delete { key: Vec<Cell> },
+}
+
+/// The table edits apply to: its quoted name and each column's type.
+#[derive(Debug, Clone, Default)]
+pub struct EditTarget {
+    pub qualified: String,
+    pub types: std::collections::HashMap<String, String>,
+}
+
+impl EditTarget {
+    pub fn new(qualified: String, columns: &[ColumnInfo]) -> EditTarget {
+        EditTarget {
+            qualified,
+            types: columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect(),
+        }
+    }
+
+    /// `value::type`, with the value written by `value` (a literal or `$n`).
+    fn typed(&self, column: &str, value: String) -> String {
+        match self.types.get(column) {
+            Some(t) => format!("{value}::{t}"),
+            None => value,
+        }
+    }
+
+    /// The statement for `change`. `value` renders each value in turn: a
+    /// `$n::text` placeholder when it will be bound, or a literal to show it.
+    fn sql(&self, change: &Change, mut value: impl FnMut(&Option<String>) -> String) -> String {
+        let mut assign = |cells: &[Cell], sep: &str, null_safe: bool| -> String {
+            cells
+                .iter()
+                .map(|(c, v)| {
+                    let rhs = self.typed(c, value(v));
+                    if null_safe && v.is_none() {
+                        format!("{} IS NULL", quote_ident(c))
+                    } else {
+                        format!("{} = {rhs}", quote_ident(c))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(sep)
+        };
+        match change {
+            Change::Update { key, set } => {
+                let set_sql = assign(set, ", ", false);
+                format!("UPDATE {} SET {set_sql} WHERE {}", self.qualified, assign(key, " AND ", true))
+            }
+            Change::Delete { key } => {
+                format!("DELETE FROM {} WHERE {}", self.qualified, assign(key, " AND ", true))
+            }
+            Change::Insert { values } if values.is_empty() => {
+                format!("INSERT INTO {} DEFAULT VALUES", self.qualified)
+            }
+            Change::Insert { values } => {
+                let cols: Vec<String> = values.iter().map(|(c, _)| quote_ident(c)).collect();
+                let vals: Vec<String> = values.iter().map(|(c, v)| self.typed(c, value(v))).collect();
+                format!("INSERT INTO {} ({}) VALUES ({})", self.qualified, cols.join(", "), vals.join(", "))
+            }
+        }
+    }
+
+    /// `change` as SQL with the values written in, to show before saving.
+    pub fn preview(&self, change: &Change) -> String {
+        let sql = self.sql(change, |v| match v {
+            Some(v) => quote_literal(v),
+            None => "NULL".into(),
+        });
+        format!("{sql};")
+    }
+
+    /// `change` with `$n` placeholders, and the values to bind to them. A
+    /// NULL in a key becomes `IS NULL` and binds nothing.
+    fn bound(&self, change: &Change) -> (String, Vec<Option<String>>) {
+        let mut params: Vec<Option<String>> = vec![];
+        let key_nulls: usize = match change {
+            Change::Update { key, .. } | Change::Delete { key } => key.iter().filter(|(_, v)| v.is_none()).count(),
+            Change::Insert { .. } => 0,
+        };
+        let sql = self.sql(change, |v| {
+            params.push(v.clone());
+            format!("${}::text", params.len())
+        });
+        if key_nulls == 0 {
+            return (sql, params);
+        }
+        // Rare (a NULL in a key): fall back to literals for this statement.
+        (self.preview(change).trim_end_matches(';').to_string(), vec![])
+    }
+}
+
 /// A database error with the server's detail, hint and position.
 pub fn describe_error(e: &tokio_postgres::Error) -> String {
     let Some(db) = e.as_db_error() else {
@@ -514,6 +621,42 @@ impl Session {
             .ok_or_else(|| anyhow!("function {sig} not found"))
     }
 
+    /// Apply row edits in one transaction: all of them, or none. An update
+    /// or delete that doesn't hit exactly one row stops and rolls back. Runs
+    /// on the catalog connection, so it never joins a transaction the user
+    /// opened in a query tab. Returns how many rows changed.
+    pub async fn apply(&self, target: &EditTarget, changes: &[Change]) -> anyhow::Result<u64> {
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        self.meta.batch_execute("BEGIN").await.map_err(pg)?;
+        let mut total = 0;
+        for (i, change) in changes.iter().enumerate() {
+            let (sql, params) = target.bound(change);
+            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+            let done = match self.meta.execute(sql.as_str(), &refs).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.meta.batch_execute("ROLLBACK").await;
+                    return Err(anyhow!("change {} of {} failed, nothing was saved: {}\n{}", i + 1, changes.len(), describe_error(&e), target.preview(change)));
+                }
+            };
+            if done != 1 && !matches!(change, Change::Insert { .. }) {
+                let _ = self.meta.batch_execute("ROLLBACK").await;
+                return Err(anyhow!(
+                    "change {} of {} matched {done} rows instead of 1 (the row may have changed or gone), nothing was saved:\n{}",
+                    i + 1,
+                    changes.len(),
+                    target.preview(change)
+                ));
+            }
+            total += done;
+        }
+        self.meta.batch_execute("COMMIT").await.map_err(pg)?;
+        Ok(total)
+    }
+
     /// Run `sql` (any number of statements) on the work connection, keeping
     /// at most `max_rows` rows per statement.
     pub async fn run(&self, sql: &str, max_rows: usize) -> anyhow::Result<QueryOutcome> {
@@ -675,6 +818,9 @@ pub fn browse_sql(
     object: &DbObject,
     filter: &str,
     order: Option<(&str, bool)>,
+    // The primary key: the order when none is chosen, and the tie-breaker
+    // when one is, so pages don't shuffle.
+    key: &[String],
     limit: usize,
     offset: usize,
 ) -> String {
@@ -682,12 +828,13 @@ pub fn browse_sql(
     if !filter.trim().is_empty() {
         sql.push_str(&format!(" WHERE {}", filter.trim()));
     }
-    if let Some((col, asc)) = order {
-        sql.push_str(&format!(
-            " ORDER BY {} {}",
-            quote_ident(col),
-            if asc { "ASC" } else { "DESC" }
-        ));
+    let mut by: Vec<String> = order
+        .iter()
+        .map(|(col, asc)| format!("{} {}", quote_ident(col), if *asc { "ASC" } else { "DESC" }))
+        .collect();
+    by.extend(key.iter().filter(|k| order.is_none_or(|(c, _)| c != k.as_str())).map(|k| quote_ident(k)));
+    if !by.is_empty() {
+        sql.push_str(&format!(" ORDER BY {}", by.join(", ")));
     }
     sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
     sql
@@ -760,9 +907,56 @@ mod tests {
             signature: None,
         };
         assert_eq!(
-            browse_sql(&o, " quantity > 1 ", Some(("order_id", false)), 100, 200),
+            browse_sql(&o, " quantity > 1 ", Some(("order_id", false)), &[], 100, 200),
             "SELECT * FROM \"shop\".\"Order Items\" WHERE quantity > 1 ORDER BY \"order_id\" DESC LIMIT 100 OFFSET 200"
         );
+        let key = ["order_id".to_string(), "product_id".to_string()];
+        assert_eq!(
+            browse_sql(&o, "", None, &key, 500, 0),
+            "SELECT * FROM \"shop\".\"Order Items\" ORDER BY \"order_id\", \"product_id\" LIMIT 500 OFFSET 0"
+        );
+        assert_eq!(
+            browse_sql(&o, "", Some(("order_id", true)), &key, 500, 0),
+            "SELECT * FROM \"shop\".\"Order Items\" ORDER BY \"order_id\" ASC, \"product_id\" LIMIT 500 OFFSET 0"
+        );
+    }
+
+    fn target() -> EditTarget {
+        EditTarget {
+            qualified: "\"shop\".\"products\"".into(),
+            types: [("id", "integer"), ("title", "text"), ("price", "numeric(10,2)")]
+                .into_iter()
+                .map(|(c, t)| (c.to_string(), t.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn changes_become_sql() {
+        let t = target();
+        let key = vec![("id".to_string(), Some("7".to_string()))];
+        let update = Change::Update {
+            key: key.clone(),
+            set: vec![("title".into(), Some("It's new".into())), ("price".into(), None)],
+        };
+        assert_eq!(
+            t.preview(&update),
+            "UPDATE \"shop\".\"products\" SET \"title\" = 'It''s new'::text, \"price\" = NULL::numeric(10,2) WHERE \"id\" = '7'::integer;"
+        );
+        let (sql, params) = t.bound(&update);
+        assert_eq!(
+            sql,
+            "UPDATE \"shop\".\"products\" SET \"title\" = $1::text::text, \"price\" = $2::text::numeric(10,2) WHERE \"id\" = $3::text::integer"
+        );
+        assert_eq!(params, vec![Some("It's new".to_string()), None, Some("7".to_string())]);
+
+        assert_eq!(t.preview(&Change::Delete { key }), "DELETE FROM \"shop\".\"products\" WHERE \"id\" = '7'::integer;");
+        assert_eq!(t.preview(&Change::Insert { values: vec![] }), "INSERT INTO \"shop\".\"products\" DEFAULT VALUES;");
+        assert_eq!(
+            t.preview(&Change::Insert { values: vec![("title".into(), Some("Mug".into()))] }),
+            "INSERT INTO \"shop\".\"products\" (\"title\") VALUES ('Mug'::text);"
+        );
+        assert_eq!(quote_literal("a'b"), "'a''b'");
     }
 
     #[test]
@@ -785,7 +979,14 @@ mod tests {
 
     /// Needs a server: `TABULA_TEST_URL=postgres://postgres:tabula@localhost/postgres`,
     /// seeded with `scripts/seed.sql`.
+    /// Or `TABULA_TEST_CONNECTION=name`, a saved connection (its password
+    /// comes from the keyring).
     fn test_session() -> Option<Arc<Session>> {
+        if let Ok(name) = std::env::var("TABULA_TEST_CONNECTION") {
+            let p = crate::profiles::load().into_iter().find(|p| p.name == name).expect("saved connection");
+            let pw = crate::profiles::password(&p.name);
+            return Some(crate::rt::block_on(Session::connect(p, pw)).expect("connect"));
+        }
         let url = std::env::var("TABULA_TEST_URL").ok()?;
         let (p, pw) = Profile::from_url("test", &url).unwrap();
         let p = Profile { ssl: SslMode::Disable, ..p };
@@ -843,6 +1044,55 @@ mod tests {
 
             let err = s.run("select * from nope", 10).await.unwrap_err();
             assert!(err.to_string().contains("42P01"), "{err}");
+
+            // Row edits, on a table only this connection sees.
+            s.meta
+                .batch_execute("create temp table tabula_edit (id serial primary key, title text not null, price numeric(10,2), tags text[])")
+                .await
+                .unwrap();
+            let t = EditTarget {
+                qualified: "tabula_edit".into(),
+                types: [("id", "integer"), ("title", "text"), ("price", "numeric(10,2)"), ("tags", "text[]")]
+                    .into_iter()
+                    .map(|(c, t)| (c.to_string(), t.to_string()))
+                    .collect(),
+            };
+            let cell = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+            let n = s
+                .apply(&t, &[
+                    Change::Insert { values: vec![cell("title", Some("Mug")), cell("price", Some("4.50")), cell("tags", Some("{a,b}"))] },
+                    Change::Insert { values: vec![cell("title", Some("Cup"))] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("It's a mug")), cell("price", None)] },
+                    Change::Delete { key: vec![cell("id", Some("2"))] },
+                ])
+                .await
+                .unwrap();
+            assert_eq!(n, 4);
+            let rows = s.meta.query("select id, title, price::text, tags::text from tabula_edit", &[]).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get::<_, String>(1), "It's a mug");
+            assert_eq!(rows[0].get::<_, Option<String>>(2), None);
+            assert_eq!(rows[0].get::<_, String>(3), "{a,b}");
+
+            // One bad change undoes the good ones before it.
+            let err = s
+                .apply(&t, &[
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("changed"))] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("price", Some("not a number"))] },
+                ])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("nothing was saved"), "{err}");
+            let err = s
+                .apply(&t, &[
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("changed"))] },
+                    Change::Delete { key: vec![cell("id", Some("99"))] },
+                ])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("matched 0 rows"), "{err}");
+            let row = s.meta.query_one("select title from tabula_edit", &[]).await.unwrap();
+            assert_eq!(row.get::<_, String>(0), "It's a mug");
         });
     }
 }

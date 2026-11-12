@@ -40,6 +40,7 @@ gpui_kit::actions!(
         ZoomReset,
         ToggleHistory,
         SaveChanges,
+        EditCell,
     ]
 );
 
@@ -131,6 +132,7 @@ fn setup(cx: &mut App, dark: bool, font_size: f32) {
         KeyBinding::new(key!("-"), ZoomOut, Some("Workspace")),
         KeyBinding::new(key!("0"), ZoomReset, Some("Workspace")),
         KeyBinding::new(key!("s"), SaveChanges, Some("DataTab")),
+        KeyBinding::new("f2", EditCell, Some("DataTab")),
     ]);
 }
 
