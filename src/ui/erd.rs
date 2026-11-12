@@ -646,6 +646,10 @@ impl ErdTab {
             .h(px(HEADER_H * z))
             .px(px(10. * z))
             .gap(px(7. * z))
+            // Clipping doesn't follow rounded corners, so the header rounds
+            // its own to sit inside the card's.
+            .rounded_t(px(9. * z - 1.))
+            .when(!self.show_columns, |d| d.rounded_b(px(9. * z - 1.)))
             .bg(pal.header)
             .child(icon(kind_icon(t.kind)).size(px(15. * z)).text_color(pal.accent))
             .child(
