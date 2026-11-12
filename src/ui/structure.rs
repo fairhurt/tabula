@@ -95,15 +95,22 @@ impl StructureTab {
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let cell = |text: String, w: f32, color: Option<Hsla>| {
+        // Every column has a fixed width but the last, which takes the room
+        // that is left and wraps, so long definitions stay readable in a
+        // narrow window.
+        let last = headers.len().saturating_sub(1);
+        let cell = |ix: usize, text: String, w: f32, color: Option<Hsla>| {
             div()
-                .w(super::rem(w))
-                .flex_shrink_0()
                 .px_2()
                 .py_1()
                 .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
+                .map(|d| {
+                    if ix == last {
+                        d.flex_1().min_w(super::rem(120.)).whitespace_normal()
+                    } else {
+                        d.w(super::rem(w)).flex_shrink_0().text_ellipsis().whitespace_nowrap()
+                    }
+                })
                 .when_some(color, |d, c| d.text_color(c))
                 .child(text)
         };
@@ -113,16 +120,20 @@ impl StructureTab {
             .border_color(theme.border)
             .rounded(theme.radius)
             .overflow_hidden()
+            // The page scrolls; a grid must keep its full height, not be
+            // squeezed to fit.
+            .flex_shrink_0()
             .child(
                 h_flex()
                     .bg(theme.table_head)
                     .text_color(theme.table_head_foreground)
                     .text_xs()
                     .font_semibold()
-                    .children(headers.iter().map(|(h, w)| cell(h.to_string(), *w, None))),
+                    .children(headers.iter().enumerate().map(|(i, (h, w))| cell(i, h.to_string(), *w, None))),
             )
             .children(rows.into_iter().enumerate().map(|(i, r)| {
                 h_flex()
+                    .items_start()
                     .border_t_1()
                     .border_color(theme.table_row_border)
                     .when(i % 2 == 1, |d| d.bg(theme.table_even))
@@ -131,7 +142,8 @@ impl StructureTab {
                     .children(
                         r.into_iter()
                             .zip(headers.iter())
-                            .map(|((t, c), (_, w))| cell(t, *w, c)),
+                            .enumerate()
+                            .map(|(i, ((t, c), (_, w)))| cell(i, t, *w, c)),
                     )
             }))
             .into_any_element()
@@ -187,7 +199,7 @@ impl Render for StructureTab {
             body = body.child(self.section("Columns", cx)).child(
                 self.grid(
                     "columns",
-                    &[("", 28.), ("Name", 200.), ("Type", 200.), ("Null", 60.), ("Default", 260.), ("Comment", 260.)],
+                    &[("", 28.), ("Name", 180.), ("Type", 180.), ("Null", 50.), ("Default", 200.), ("Comment", 260.)],
                     info.columns
                         .iter()
                         .map(|c| {
@@ -207,7 +219,7 @@ impl Render for StructureTab {
             if !info.indexes.is_empty() {
                 body = body.child(self.section("Indexes", cx)).child(self.grid(
                     "indexes",
-                    &[("Name", 220.), ("Definition", 720.)],
+                    &[("Name", 200.), ("Definition", 720.)],
                     info.indexes
                         .iter()
                         .map(|i| vec![(i.name.clone(), None), (i.definition.clone(), muted)])
@@ -219,7 +231,7 @@ impl Render for StructureTab {
             if !cons.is_empty() {
                 body = body.child(self.section("Constraints", cx)).child(self.grid(
                     "constraints",
-                    &[("Name", 220.), ("Kind", 100.), ("Definition", 620.)],
+                    &[("Name", 200.), ("Kind", 100.), ("Definition", 620.)],
                     cons.iter()
                         .map(|k| {
                             let kind = match k.kind.as_str() {

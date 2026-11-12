@@ -5,7 +5,7 @@
 use gpui_kit::component::{
     StyledExt as _,
     ActiveTheme as _, Disableable as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonRounded, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -57,7 +57,8 @@ pub struct AiPanel {
     models: HashMap<String, String>,
     /// Typing a model id that isn't in the list.
     custom_model: Entity<InputState>,
-    typing_model: bool,
+    /// The agent a model id is being typed for.
+    typing_model: Option<Agent>,
     _subs: Vec<Subscription>,
 }
 
@@ -74,15 +75,17 @@ impl AiPanel {
                 this.send_input(window, cx);
             }
         });
-        let custom_model = cx.new(|cx| InputState::new(window, cx).placeholder("Model id, then Enter"));
+        let custom_model = cx.new(|cx| InputState::new(window, cx).placeholder("Model id, then Enter (Esc to cancel)"));
         let sub2 = cx.subscribe_in(&custom_model, window, |this, input, e: &InputEvent, _, cx| match e {
             InputEvent::PressEnter { .. } => {
                 let id = input.read(cx).value().trim().to_string();
-                this.typing_model = false;
-                this.set_model((!id.is_empty()).then_some(id), cx);
+                if let (Some(agent), false) = (this.typing_model.take(), id.is_empty()) {
+                    this.choose(agent, Some(id), cx);
+                }
+                cx.notify();
             }
             InputEvent::Blur => {
-                this.typing_model = false;
+                this.typing_model = None;
                 cx.notify();
             }
             _ => {}
@@ -99,7 +102,7 @@ impl AiPanel {
             scroll: ScrollHandle::new(),
             models: HashMap::new(),
             custom_model,
-            typing_model: false,
+            typing_model: None,
             _subs: vec![sub, sub2],
         }
     }
@@ -123,14 +126,34 @@ impl AiPanel {
         self.models.get(self.agent.key()).map(String::as_str)
     }
 
-    /// Pick a model for the current agent; `None` is the agent's default.
-    /// The conversation carries on with the new model.
-    fn set_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+    /// Use `agent` with `model` (`None` is the agent's own default). The
+    /// same agent carries the conversation on with the new model; another
+    /// agent starts its own session, with the earlier turns still shown.
+    fn choose(&mut self, agent: Agent, model: Option<String>, cx: &mut Context<Self>) {
+        if self.run.is_some() {
+            return;
+        }
+        if self.agent != agent {
+            self.agent = agent;
+            self.session = None;
+        }
+        self.typing_model = None;
         match model {
-            Some(m) => self.models.insert(self.agent.key().to_string(), m),
-            None => self.models.remove(self.agent.key()),
+            Some(m) => self.models.insert(agent.key().to_string(), m),
+            None => self.models.remove(agent.key()),
         };
         cx.emit(AiPanelEvent::Prefs);
+        cx.notify();
+    }
+
+    /// Show the field for typing a model id for `agent`.
+    fn type_model(&mut self, agent: Agent, window: &mut Window, cx: &mut Context<Self>) {
+        self.typing_model = Some(agent);
+        let current = self.models.get(agent.key()).cloned().unwrap_or_default();
+        self.custom_model.update(cx, |i, cx| {
+            i.set_value(current, window, cx);
+            i.focus(window, cx);
+        });
         cx.notify();
     }
 
@@ -369,68 +392,62 @@ impl AiPanel {
 impl Render for AiPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let agents = Agent::ALL.map(|a| {
-            let installed = self.installed.contains(&a);
-            Button::new(SharedString::from(format!("agent-{a:?}")))
-                .xsmall()
-                .label(match a {
-                    Agent::Claude => "Claude Code",
-                    Agent::Copilot => "Copilot CLI",
-                })
-                .when(self.agent == a, |b| b.primary())
-                .when(self.agent != a, |b| b.ghost())
-                .when(!installed, |b| b.tooltip(a.install_hint()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.agent != a {
-                        this.agent = a;
-                        this.session = None;
-                        this.typing_model = false;
-                        cx.emit(AiPanelEvent::Prefs);
-                        cx.notify();
-                    }
-                }))
-        });
         let agent = self.agent;
         let current = self.model().map(str::to_string);
-        let weak = cx.entity().downgrade();
-        let model_menu = Button::new("ai-model")
-            .xsmall()
-            .ghost()
-            .icon(icon("cpu"))
-            .label(agent.model_label(current.as_deref()))
-            .tooltip("Model")
-            .dropdown_menu({
-                let current = current.clone();
-                move |menu, _, _| {
-                    let pick = |label: String, id: Option<String>| {
-                        let weak = weak.clone();
-                        PopupMenuItem::new(label)
-                            .checked(current == id)
-                            .on_click(move |_, _, cx| {
-                                let _ = weak.update(cx, |this, cx| this.set_model(id.clone(), cx));
-                            })
-                    };
-                    let mut menu = menu.item(pick(format!("Default ({}'s own)", agent.label()), None));
-                    for (label, id) in agent.models() {
-                        menu = menu.item(pick(label.to_string(), Some(id.to_string())));
-                    }
-                    // A typed id that isn't in the list stays visible and checked.
-                    if let Some(c) = current.clone().filter(|c| !agent.models().iter().any(|(_, id)| id == c)) {
-                        menu = menu.item(pick(c.clone(), Some(c)));
-                    }
-                    let weak = weak.clone();
-                    menu.separator().item(PopupMenuItem::new("Other model…").on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.typing_model = true;
-                            this.custom_model.update(cx, |i, cx| {
-                                i.set_value("", window, cx);
-                                i.focus(window, cx);
-                            });
-                            cx.notify();
+        let running = self.run.is_some();
+        let picker = {
+            let weak = cx.entity().downgrade();
+            let installed = self.installed.clone();
+            let models = self.models.clone();
+            Button::new("ai-model")
+                .small()
+                .ghost()
+                .rounded(ButtonRounded::Large)
+                .icon(icon(agent_icon(agent)))
+                .label(format!("{} · {}", agent.short_label(), agent.model_label(current.as_deref())))
+                .tooltip("Choose the agent and model")
+                .disabled(running)
+                // Opens upwards: the prompt box sits at the bottom of the panel.
+                .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, move |mut menu, _, _| {
+                    for (n, a) in Agent::ALL.into_iter().enumerate() {
+                        let ready = installed.contains(&a);
+                        let chosen = models.get(a.key()).cloned();
+                        if n > 0 {
+                            menu = menu.separator();
+                        }
+                        menu = menu.label(if ready {
+                            a.label().to_string()
+                        } else {
+                            format!("{} · not installed", a.label())
                         });
-                    }))
-                }
-            });
+                        // One click picks the agent and its model together.
+                        let pick = |label: String, id: Option<String>| {
+                            let weak = weak.clone();
+                            PopupMenuItem::new(label)
+                                .checked(a == agent && chosen == id)
+                                .disabled(!ready)
+                                .on_click(move |_, _, cx| {
+                                    let _ = weak.update(cx, |this, cx| this.choose(a, id.clone(), cx));
+                                })
+                        };
+                        menu = menu.item(pick("Default".into(), None));
+                        for (label, id) in a.models() {
+                            menu = menu.item(pick(label.to_string(), Some(id.to_string())));
+                        }
+                        // A typed id that isn't in the list stays visible.
+                        if let Some(c) = chosen.clone().filter(|c| !a.models().iter().any(|(_, id)| id == c)) {
+                            menu = menu.item(pick(c.clone(), Some(c)));
+                        }
+                        let weak = weak.clone();
+                        menu = menu.item(PopupMenuItem::new("Other model…").disabled(!ready).on_click(
+                            move |_, window, cx| {
+                                let _ = weak.update(cx, |this, cx| this.type_model(a, window, cx));
+                            },
+                        ));
+                    }
+                    menu
+                })
+        };
         let messages: Vec<_> = self
             .messages
             .iter()
@@ -461,13 +478,10 @@ impl Render for AiPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                     ),
             )
-            .child(h_flex().px_3().py_1().gap_1().children(agents).child(div().flex_1()).child(model_menu))
-            .when(self.typing_model, |d| {
-                d.child(div().px_3().pb_1().child(Input::new(&self.custom_model).small()))
-            })
             .child(
                 div()
                     .px_3()
+                    .pt_2()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(match &self.target {
@@ -497,7 +511,21 @@ impl Render for AiPanel {
                                         .text_sm()
                                         .child(icon("bot").large())
                                         .child("The agent can read your schema and run read-only queries.")
-                                        .child(div().text_xs().child("Try: \"Which tables reference customers?\""))
+                                        .child(
+                                            v_flex().pt_2().gap_1().items_center().children(
+                                                SUGGESTIONS.iter().enumerate().map(|(i, text)| {
+                                                    Button::new(("suggest", i))
+                                                        .small()
+                                                        .outline()
+                                                        .rounded(ButtonRounded::Large)
+                                                        .label(*text)
+                                                        .disabled(self.target.is_none())
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.ask(SUGGESTIONS[i].to_string(), cx)
+                                                        }))
+                                                }),
+                                            ),
+                                        )
                                         .when(not_installed, |d| {
                                             d.child(
                                                 div()
@@ -520,34 +548,84 @@ impl Render for AiPanel {
                     ),
             )
             .child(
-                h_flex()
-                    .p_2()
-                    .gap_1()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.input).small()))
-                    .map(|d| {
-                        if self.run.is_some() {
-                            d.child(
-                                Button::new("stop-ai")
-                                    .small()
-                                    .danger()
-                                    .icon(icon("square"))
-                                    .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                            )
-                        } else {
-                            d.child(
-                                Button::new("send-ai")
-                                    .small()
-                                    .primary()
-                                    .icon(icon("arrow-up"))
-                                    .disabled(self.target.is_none())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send_input(window, cx)
-                                    })),
-                            )
-                        }
-                    }),
+                div().p_2().child(
+                    v_flex()
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .child(div().px_1().pt_1().child(Input::new(&self.input).appearance(false)))
+                        .child(
+                            h_flex()
+                                .px_1()
+                                .pb_1()
+                                .gap_1()
+                                .map(|d| match self.typing_model {
+                                    // Typing a model id takes the picker's place.
+                                    Some(a) => d
+                                        .child(
+                                            div()
+                                                .pl_2()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!("{} model", a.short_label())),
+                                        )
+                                        .child(div().flex_1().child(Input::new(&self.custom_model).xsmall()))
+                                        .child(
+                                            Button::new("model-cancel")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(icon("x"))
+                                                .tooltip("Keep the current model")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.typing_model = None;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                    None => d.child(picker).child(div().flex_1()),
+                                })
+                                .map(|d| {
+                                    if running {
+                                        d.child(
+                                            Button::new("stop-ai")
+                                                .small()
+                                                .danger()
+                                                .rounded(ButtonRounded::Large)
+                                                .icon(icon("square"))
+                                                .tooltip("Stop")
+                                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                                        )
+                                    } else {
+                                        d.child(
+                                            Button::new("send-ai")
+                                                .small()
+                                                .primary()
+                                                .rounded(ButtonRounded::Large)
+                                                .icon(icon("arrow-up"))
+                                                .tooltip("Send (Enter)")
+                                                .disabled(self.target.is_none())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.send_input(window, cx)
+                                                })),
+                                        )
+                                    }
+                                }),
+                        ),
+                ),
             )
+    }
+}
+
+/// Starters shown in an empty conversation.
+const SUGGESTIONS: [&str; 3] = [
+    "Give me a tour of this database",
+    "Which tables reference each other?",
+    "What are the largest tables, and what do they hold?",
+];
+
+fn agent_icon(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Claude => "sparkles",
+        Agent::Copilot => "bot",
     }
 }

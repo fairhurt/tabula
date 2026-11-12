@@ -41,6 +41,14 @@ impl Agent {
         }
     }
 
+    /// A name short enough for a button.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude Code",
+            Agent::Copilot => "Copilot",
+        }
+    }
+
     /// The key this agent's preferences are saved under.
     pub fn key(self) -> &'static str {
         self.command()
@@ -62,7 +70,7 @@ impl Agent {
     /// What to show for a `--model` value.
     pub fn model_label(self, model: Option<&str>) -> String {
         match model {
-            None => "Default model".into(),
+            None => "Default".into(),
             Some(m) => self
                 .models()
                 .iter()
