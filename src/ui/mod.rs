@@ -4,6 +4,7 @@ mod ai_panel;
 mod connect;
 mod data;
 mod grid;
+mod history;
 mod query;
 mod structure;
 mod workspace;

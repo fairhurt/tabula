@@ -21,7 +21,7 @@ use gpui_kit::{
 use tokio_postgres::CancelToken;
 
 use super::grid::{self, ResultGrid};
-use super::{AskAiInEditor, CopySelection, RunQuery, icon};
+use super::{AskAiInEditor, CopySelection, RunQuery, ToggleHistory, icon};
 use crate::db::{ResultSet, Session};
 use crate::rt;
 
@@ -35,6 +35,8 @@ pub enum QueryEvent {
     FocusAi,
     /// The status bar should show this.
     Status(String),
+    /// A statement finished; remember it in the history.
+    Ran(crate::history::Entry),
 }
 
 pub struct QueryTab {
@@ -137,10 +139,11 @@ impl QueryTab {
 
     pub fn run(&mut self, cx: &mut Context<Self>) {
         let sql = self.sql_to_run(cx);
-        self.run_sql(sql, cx);
+        self.run_sql(sql, true, cx);
     }
 
-    fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+    /// `record`: keep it in the query history.
+    fn run_sql(&mut self, sql: String, record: bool, cx: &mut Context<Self>) {
         if sql.trim().is_empty() || self.running {
             return;
         }
@@ -154,12 +157,30 @@ impl QueryTab {
             t.refresh(cx);
         });
         let session = self.session.clone();
+        let started = std::time::Instant::now();
+        let mut entry = record.then(|| crate::history::Entry {
+            at: chrono::Local::now().to_rfc3339(),
+            connection: session.profile.name.clone(),
+            database: session.profile.database.clone(),
+            sql: sql.trim().to_string(),
+            elapsed_ms: 0,
+            rows: None,
+            error: None,
+        });
         let fut = rt::spawn(async move { session.run(&sql, MAX_ROWS).await });
         cx.spawn(async move |this, cx| {
             let out = fut.await;
             let _ = this.update(cx, |this, cx| {
                 this.running = false;
                 this.cancel = None;
+                if let Some(mut e) = entry.take() {
+                    e.elapsed_ms = started.elapsed().as_millis() as u64;
+                    match &out {
+                        Ok(o) => e.rows = Some(o.results.iter().map(|r| r.row_count).sum()),
+                        Err(err) => e.error = Some(err.to_string()),
+                    }
+                    cx.emit(QueryEvent::Ran(e));
+                }
                 match out {
                     Ok(out) => {
                         let ms = out.elapsed.as_secs_f64() * 1000.;
@@ -226,7 +247,7 @@ impl QueryTab {
         if sql.is_empty() {
             return;
         }
-        self.run_sql(format!("EXPLAIN {sql}"), cx);
+        self.run_sql(format!("EXPLAIN {sql}"), false, cx);
     }
 
     fn ask_ai(&mut self, what: AiAsk, cx: &mut Context<Self>) {
@@ -315,6 +336,15 @@ impl QueryTab {
                 )
             })
             .child(div().flex_1())
+            .child(
+                Button::new("history")
+                    .small()
+                    .ghost()
+                    .icon(icon("history"))
+                    .label("History")
+                    .tooltip("Queries you ran before (Ctrl+H)")
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleHistory), cx)),
+            )
             .child(
                 div()
                     .text_xs()

@@ -18,6 +18,7 @@
 mod agents;
 mod ai;
 mod db;
+mod history;
 mod link;
 mod mcp;
 mod profiles;

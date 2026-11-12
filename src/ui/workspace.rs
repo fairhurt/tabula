@@ -26,11 +26,13 @@ use gpui_kit::{
 use super::ai_panel::{AiPanel, AiPanelEvent};
 use super::connect::{ConnectEvent, ConnectForm};
 use super::data::DataTab;
+use super::history::{HistoryEvent, HistoryView};
 use super::query::{QueryEvent, QueryTab};
 use super::structure::{StructureTab, kind_icon};
-use super::{CloseTab, NewQuery, Refresh, ToggleAi, ZoomIn, ZoomOut, ZoomReset, icon};
+use super::{CloseTab, NewQuery, Refresh, ToggleAi, ToggleHistory, ZoomIn, ZoomOut, ZoomReset, icon};
 use crate::agents::{Agent, McpStatus};
 use crate::db::{DbObject, ObjectKind, Session};
+use crate::history::History;
 use crate::link::{self, LinkReply, LinkRequest};
 use crate::profiles::{self, AiAccess, Profile};
 use crate::rt;
@@ -151,6 +153,7 @@ enum Modal {
     Connect(Entity<ConnectForm>),
     Agents,
     Approve(Approval),
+    History(Entity<HistoryView>),
 }
 
 /// Views the headless screenshots step through.
@@ -207,6 +210,7 @@ pub struct Workspace {
     focus: FocusHandle,
     query_count: usize,
     settings: Settings,
+    history: History,
     _subs: Vec<Subscription>,
 }
 
@@ -277,6 +281,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             query_count: 0,
             settings,
+            history: if live { History::open() } else { History::in_memory() },
             _subs: vec![sub],
         };
         if let Some((ix, pw)) = auto {
@@ -618,6 +623,11 @@ impl Workspace {
     fn on_tab_event<E>(&mut self, _: Entity<E>, e: &QueryEvent, cx: &mut Context<Self>) {
         match e {
             QueryEvent::Status(s) => self.status = s.clone().into(),
+            QueryEvent::Ran(entry) => {
+                if let Err(e) = self.history.record(entry.clone()) {
+                    self.status = format!("Couldn't save query history: {e}").into();
+                }
+            }
             QueryEvent::AskAi(prompt) => self.ask_ai(prompt.clone(), cx),
             QueryEvent::FocusAi => {
                 self.show_ai = true;
@@ -792,6 +802,44 @@ impl Workspace {
             let title = format!("Query {}", self.query_count);
             self.open_query(s, title, sql.to_string(), run, window, cx);
         }
+    }
+
+    // ------------------------------------------------------------ history
+
+    fn toggle_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(Modal::History(_))) {
+            self.modal = None;
+            cx.notify();
+            return;
+        }
+        if self.modal.is_some() {
+            return;
+        }
+        let view = cx.new(|cx| HistoryView::new(self.history.entries(), window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, e: &HistoryEvent, window, cx| {
+            match e {
+                HistoryEvent::Insert(sql) => {
+                    this.modal = None;
+                    this.put_sql(sql, false, window, cx);
+                }
+                HistoryEvent::Run(sql) => {
+                    this.modal = None;
+                    this.put_sql(sql, true, window, cx);
+                }
+                HistoryEvent::Clear => {
+                    this.status = match this.history.clear() {
+                        Ok(()) => "Query history cleared".into(),
+                        Err(e) => format!("Couldn't clear query history: {e}").into(),
+                    };
+                }
+                HistoryEvent::Close => this.modal = None,
+            }
+            cx.notify();
+        });
+        self._subs.push(sub);
+        view.update(cx, |v, cx| v.focus(window, cx));
+        self.modal = Some(Modal::History(view));
+        cx.notify();
     }
 
     // ------------------------------------------------------------ settings
@@ -1392,7 +1440,9 @@ impl Workspace {
                     .child(tip("Double-click", "a table to browse its rows"))
                     .child(tip("Ctrl+T", "new query tab"))
                     .child(tip("Ctrl+Enter", "run the query"))
+                    .child(tip("Ctrl+H", "query history"))
                     .child(tip("Ctrl+Shift+A", "Ask AI panel"))
+                    .child(tip("Ctrl+= / Ctrl+-", "larger or smaller text"))
                     .child(tip("Right-click", "more actions")),
             )
             .child(
@@ -1629,6 +1679,15 @@ impl Workspace {
             .child(div().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.status.clone()))
             .child(format!("{connected} open"))
             .child(
+                Button::new("status-history")
+                    .xsmall()
+                    .ghost()
+                    .icon(icon("history"))
+                    .label("History")
+                    .tooltip("Query history (Ctrl+H)")
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_history(window, cx))),
+            )
+            .child(
                 Button::new("status-zoom")
                     .xsmall()
                     .ghost()
@@ -1725,8 +1784,9 @@ impl Render for Workspace {
             Modal::Connect(f) => f.clone().into_any_element(),
             Modal::Agents => self.render_agents(cx).into_any_element(),
             Modal::Approve(a) => self.render_approval(a, cx).into_any_element(),
+            Modal::History(h) => h.clone().into_any_element(),
         });
-        let closable = matches!(self.modal, Some(Modal::Agents));
+        let closable = matches!(self.modal, Some(Modal::Agents | Modal::History(_)));
         v_flex()
             .size_full()
             .key_context("Workspace")
@@ -1744,6 +1804,7 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| this.toggle_history(window, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(Some(1.), cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(Some(-1.), cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(None, cx)))
