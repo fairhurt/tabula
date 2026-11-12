@@ -164,11 +164,49 @@ enum Modal {
     Discard(Discard),
 }
 
-/// What is being closed, and how many unsaved edits go with it.
+/// What is being closed, and what would be lost with it.
 #[derive(Clone, Copy)]
 enum Discard {
-    Tab { tab: usize, edits: usize },
-    Quit { edits: usize },
+    Tab { tab: usize, unsaved: Unsaved },
+    Quit { unsaved: Unsaved },
+}
+
+/// Work that exists only in open tabs.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct Unsaved {
+    /// Row edits staged in Data tabs and not saved.
+    edits: usize,
+    /// Query tabs holding SQL that hasn't been run.
+    queries: usize,
+}
+
+impl Unsaved {
+    fn none(self) -> bool {
+        self.edits == 0 && self.queries == 0
+    }
+
+    fn plus(self, other: Unsaved) -> Unsaved {
+        Unsaved { edits: self.edits + other.edits, queries: self.queries + other.queries }
+    }
+
+    /// What would be lost, as a sentence.
+    fn describe(self) -> String {
+        let edits = match self.edits {
+            0 => None,
+            1 => Some("1 row change hasn't been saved to the database".to_string()),
+            n => Some(format!("{n} row changes haven't been saved to the database")),
+        };
+        let queries = match self.queries {
+            0 => None,
+            1 => Some("the SQL in 1 query tab hasn't been run, so it isn't in your history".to_string()),
+            n => Some(format!("the SQL in {n} query tabs hasn't been run, so it isn't in your history")),
+        };
+        let mut text = [edits, queries].into_iter().flatten().collect::<Vec<_>>().join(", and ");
+        if let Some(first) = text.get(..1) {
+            text = format!("{}{}", first.to_uppercase(), &text[1..]);
+        }
+        format!("{text}. It will be lost.")
+    }
 }
 
 /// Views the headless screenshots step through.
@@ -888,36 +926,37 @@ impl Workspace {
         self.add_tab(Tab::Erd(tab), cx);
     }
 
-    /// Row edits staged in a tab and not saved.
-    fn unsaved_in(&self, ix: usize, cx: &gpui_kit::App) -> usize {
+    /// What closing a tab would lose: staged row edits, or SQL not yet run.
+    fn unsaved_in(&self, ix: usize, cx: &gpui_kit::App) -> Unsaved {
         match self.tabs.get(ix) {
-            Some(Tab::Data(t)) => t.read(cx).pending(cx),
-            _ => 0,
+            Some(Tab::Data(t)) => Unsaved { edits: t.read(cx).pending(cx), queries: 0 },
+            Some(Tab::Query(t)) => Unsaved { edits: 0, queries: usize::from(t.read(cx).unsaved(cx)) },
+            _ => Unsaved::default(),
         }
     }
 
-    /// Close a tab, asking first if that would lose unsaved row edits.
+    /// Close a tab, asking first if that would lose unsaved work.
     fn ask_to_close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let edits = self.unsaved_in(ix, cx);
-        if edits == 0 {
+        let unsaved = self.unsaved_in(ix, cx);
+        if unsaved.none() {
             self.close_tab(ix, cx);
         } else if self.modal.is_none() {
             self.active = ix;
-            self.modal = Some(Modal::Discard(Discard::Tab { tab: ix, edits }));
+            self.modal = Some(Modal::Discard(Discard::Tab { tab: ix, unsaved }));
             cx.notify();
         }
     }
 
-    /// Whether the window may close now. If tabs hold unsaved row edits,
-    /// asks instead, and the answer closes it.
+    /// Whether the window may close now. If tabs hold unsaved work, asks
+    /// instead, and the answer closes it.
     fn may_quit(&mut self, cx: &mut Context<Self>) -> bool {
-        let edits: usize = (0..self.tabs.len()).map(|i| self.unsaved_in(i, cx)).sum();
-        if edits == 0 {
+        let unsaved = (0..self.tabs.len()).map(|i| self.unsaved_in(i, cx)).fold(Unsaved::default(), Unsaved::plus);
+        if unsaved.none() {
             return true;
         }
         // Another dialog (an agent's approval, say) keeps its place.
         if self.modal.is_none() || matches!(self.modal, Some(Modal::Agents | Modal::History(_))) {
-            self.modal = Some(Modal::Discard(Discard::Quit { edits }));
+            self.modal = Some(Modal::Discard(Discard::Quit { unsaved }));
         }
         cx.notify();
         false
@@ -925,12 +964,12 @@ impl Workspace {
 
     fn render_discard(&self, what: Discard, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let (edits, title, confirm) = match what {
-            Discard::Tab { tab, edits } => {
+        let (unsaved, title, confirm) = match what {
+            Discard::Tab { tab, unsaved } => {
                 let name = self.tabs.get(tab).map(|t| t.title(cx).to_string()).unwrap_or_default();
-                (edits, format!("Close {name} without saving?"), "Discard and close")
+                (unsaved, format!("Close {name}?"), "Discard and close")
             }
-            Discard::Quit { edits } => (edits, "Quit without saving?".to_string(), "Discard and quit"),
+            Discard::Quit { unsaved } => (unsaved, "Quit Tabula?".to_string(), "Discard and quit"),
         };
         v_flex()
             .w(super::rem(460.))
@@ -947,11 +986,7 @@ impl Workspace {
                     .child(icon("pencil-line").text_color(theme.warning))
                     .child(div().text_lg().font_semibold().child(title)),
             )
-            .child(div().text_sm().text_color(theme.muted_foreground).child(format!(
-                "{edits} row change{} {} not been saved to the database and will be lost.",
-                if edits == 1 { "" } else { "s" },
-                if edits == 1 { "has" } else { "have" },
-            )))
+            .child(div().text_sm().text_color(theme.muted_foreground).child(unsaved.describe()))
             .child(
                 h_flex()
                     .gap_2()
@@ -2099,6 +2134,29 @@ fn start_installer(path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(not(windows))]
 fn start_installer(_: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!("updates install themselves on Windows only")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Unsaved;
+
+    #[test]
+    fn says_what_closing_would_lose() {
+        assert!(Unsaved::default().none());
+        assert_eq!(
+            Unsaved { edits: 1, queries: 0 }.describe(),
+            "1 row change hasn't been saved to the database. It will be lost."
+        );
+        assert_eq!(
+            Unsaved { edits: 0, queries: 1 }.describe(),
+            "The SQL in 1 query tab hasn't been run, so it isn't in your history. It will be lost."
+        );
+        let both = Unsaved { edits: 3, queries: 0 }.plus(Unsaved { edits: 0, queries: 2 });
+        assert_eq!(
+            both.describe(),
+            "3 row changes haven't been saved to the database, and the SQL in 2 query tabs hasn't been run, so it isn't in your history. It will be lost."
+        );
+    }
 }
 
 fn schema_nodes(names: &[String]) -> Vec<SchemaNode> {

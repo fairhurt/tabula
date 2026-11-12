@@ -51,6 +51,9 @@ pub struct QueryTab {
     error: Option<String>,
     summary: Option<String>,
     last_sql: String,
+    /// The editor's text as it was opened or last run whole: text that can
+    /// be had again, from wherever it came or from the history.
+    kept: String,
     /// A cell's whole value, shown over the tab.
     viewing: Option<grid::CellValue>,
     _subs: Vec<gpui_kit::Subscription>,
@@ -126,6 +129,7 @@ impl QueryTab {
             error: None,
             summary: None,
             last_sql: String::new(),
+            kept: sql.to_string(),
             focus: cx.focus_handle(),
         }
     }
@@ -172,7 +176,19 @@ impl QueryTab {
 
     pub fn run(&mut self, cx: &mut Context<Self>) {
         let sql = self.sql_to_run(cx);
+        // Running everything puts it all in the history; running a
+        // selection leaves the rest only here.
+        let whole = self.sql(cx);
+        if sql == whole {
+            self.kept = whole;
+        }
         self.run_sql(sql, true, cx);
+    }
+
+    /// Whether closing the tab would lose SQL: there is some, and it isn't
+    /// what the tab opened with or last ran.
+    pub fn unsaved(&self, cx: &gpui_kit::App) -> bool {
+        unsaved_sql(&self.sql(cx), &self.kept)
     }
 
     /// `record`: keep it in the query history.
@@ -533,6 +549,27 @@ impl QueryTab {
             Err(e) => format!("Couldn't save CSV: {e}"),
         };
         cx.emit(QueryEvent::Status(msg));
+    }
+}
+
+/// Whether `text` holds SQL that `kept` (what was opened or run) doesn't.
+fn unsaved_sql(text: &str, kept: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && text != kept.trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsaved_sql;
+
+    #[test]
+    fn sql_is_unsaved_until_it_has_been_run_whole() {
+        assert!(!unsaved_sql("", ""));
+        assert!(!unsaved_sql("  \n", ""));
+        assert!(unsaved_sql("select 1", ""));
+        // What it opened with, or last ran, give or take blank space.
+        assert!(!unsaved_sql("select 1\n", "select 1"));
+        assert!(unsaved_sql("select 1; select 2", "select 1"));
     }
 }
 
