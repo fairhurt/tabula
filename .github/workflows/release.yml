@@ -1,0 +1,65 @@
+# Builds the Windows installer and publishes a GitHub release when a version
+# tag is pushed:
+#
+#   1. Set `version` in Cargo.toml (say 0.3.0) and commit.
+#   2. git tag v0.3.0 && git push origin v0.3.0
+#
+# Tabula's own update check reads the latest release, so publishing here is
+# what makes installed copies offer the update.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "The tag is $env:GITHUB_REF_NAME but Cargo.toml says $version. Bump the version, commit, and tag that commit."
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          & $iscc "/DAppVersion=$env:VERSION" installer\tabula.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+
+          # A copy that needs no installing, and a checksum for each download.
+          Compress-Archive -Path target\release\tabula.exe, LICENSE-MIT, LICENSE-APACHE -DestinationPath "dist\Tabula-$env:VERSION-windows-x64.zip"
+          Get-ChildItem dist -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -Encoding ascii -NoNewline "$($_.FullName).sha256"
+          }
+          Get-ChildItem dist
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME @files --title "Tabula $env:VERSION" --generate-notes

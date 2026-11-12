@@ -28,6 +28,7 @@ mod profiles;
 mod rt;
 mod settings;
 mod ui;
+mod update;
 
 use anyhow::bail;
 

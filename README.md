@@ -23,6 +23,14 @@ Claude Code and GitHub Copilot CLI can explore and query your databases through 
 
 <br>
 
+## 📦 Install
+
+**Windows:** download `Tabula-Setup-<version>.exe` from the [latest release](https://github.com/fairhurt/tabula/releases/latest) and run it. It installs for your user only (no administrator prompt) and adds Tabula to the Start menu. The installer isn't code-signed yet, so Windows SmartScreen may say "Windows protected your PC": choose **More info**, then **Run anyway**. A `.zip` with just `tabula.exe` is there too if you'd rather not install.
+
+**macOS and Linux:** build from source for now (see Building below).
+
+Tabula checks for a newer release when it starts. When there is one, the status bar shows **Update to x.y.z**: one click downloads the installer, checks it against the release's SHA-256, installs it and restarts Tabula. The check is one anonymous request to GitHub; turn it off with `"check_for_updates": false` in `settings.json`.
+
 ## ✨ Highlights
 
 <table>
@@ -194,6 +202,26 @@ On Linux, GPUI needs Vulkan and the fontconfig, xkbcommon and OpenSSL dev packag
 ```sh
 sudo apt install libfontconfig-dev libxkbcommon-x11-dev libssl-dev
 ```
+
+To build the Windows installer yourself, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run:
+
+```sh
+cargo build --release
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=0.2.0 installer/tabula.iss
+```
+
+The installer lands in `dist/`.
+
+### Releasing
+
+Set `version` in `Cargo.toml`, commit, then tag that commit and push the tag:
+
+```sh
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+The Release workflow tests, builds the installer and a portable zip with checksums, and publishes them as a GitHub release. Installed copies offer the update the next time they start.
 
 The app icon is drawn in `assets/icon.svg`; the build renders it and, on Windows, embeds it in the executable.
 

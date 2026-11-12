@@ -20,6 +20,8 @@ pub struct Settings {
     pub agent: Option<String>,
     /// The model picked for each agent, by agent key. Absent: the CLI's default.
     pub models: HashMap<String, String>,
+    /// Ask GitHub at startup whether a newer Tabula is out.
+    pub check_for_updates: bool,
 }
 
 impl Default for Settings {
@@ -28,6 +30,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             agent: None,
             models: HashMap::new(),
+            check_for_updates: true,
         }
     }
 }
@@ -69,6 +72,7 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"font_size": 40}"#).unwrap();
         assert_eq!(s.font_size(), MAX_FONT_SIZE);
         assert!(s.models.is_empty());
+        assert!(s.check_for_updates);
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.font_size(), DEFAULT_FONT_SIZE);
     }

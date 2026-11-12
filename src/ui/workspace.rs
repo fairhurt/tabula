@@ -230,6 +230,10 @@ pub struct Workspace {
     query_count: usize,
     settings: Settings,
     history: History,
+    /// A newer release, once the startup check has found one.
+    update: Option<crate::update::Release>,
+    /// The update is being downloaded.
+    updating: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -314,8 +318,13 @@ impl Workspace {
             query_count: 0,
             settings,
             history: if live { History::open() } else { History::in_memory() },
+            update: None,
+            updating: false,
             _subs: vec![sub],
         };
+        if live && ws.settings.check_for_updates && crate::update::enabled() {
+            ws.check_for_update(cx);
+        }
         if let Some((ix, pw)) = auto {
             ws.connect(ix, pw, cx);
         }
@@ -925,6 +934,58 @@ impl Workspace {
         self._subs.push(sub);
         view.update(cx, |v, cx| v.focus(window, cx));
         self.modal = Some(Modal::History(view));
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------ updates
+
+    /// Ask GitHub, quietly, whether a newer release is out.
+    fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        let fut = rt::spawn(async { tokio::task::spawn_blocking(crate::update::check).await? });
+        cx.spawn(async move |this, cx| {
+            // Offline, or no release yet: nothing to say.
+            if let Ok(Some(release)) = fut.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = format!("Tabula {} is available", release.version).into();
+                    this.update = Some(release);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Install the newer release: on Windows download its installer, check
+    /// it and run it; elsewhere open its page.
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(release) = self.update.clone() else { return };
+        if self.updating {
+            return;
+        }
+        let installer = if cfg!(windows) { release.installer.clone() } else { None };
+        let Some(installer) = installer else {
+            cx.open_url(&release.page);
+            return;
+        };
+        self.updating = true;
+        self.status = format!("Downloading Tabula {}…", release.version).into();
+        let fut = rt::spawn(async move { tokio::task::spawn_blocking(move || crate::update::download(&installer)).await? });
+        cx.spawn(async move |this, cx| {
+            let downloaded = fut.await;
+            let _ = this.update(cx, |this, cx| {
+                this.updating = false;
+                match downloaded.and_then(|path| start_installer(&path)) {
+                    // The installer closes this window and starts the new version.
+                    Ok(()) => cx.quit(),
+                    Err(e) => {
+                        this.status = format!("Couldn't update: {e}").into();
+                        cx.open_url(&release.page);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1827,6 +1888,20 @@ impl Workspace {
             .text_color(theme.muted_foreground)
             .child(div().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.status.clone()))
             .child(format!("{connected} open"))
+            .children(self.update.as_ref().map(|release| {
+                Button::new("status-update")
+                    .xsmall()
+                    .primary()
+                    .icon(icon("download"))
+                    .label(format!("Update to {}", release.version))
+                    .tooltip(if cfg!(windows) && release.installer.is_some() {
+                        "Download the new version, install it and restart Tabula"
+                    } else {
+                        "Open the download page"
+                    })
+                    .loading(self.updating)
+                    .on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
+            }))
             .child(
                 Button::new("status-history")
                     .xsmall()
@@ -1875,6 +1950,16 @@ impl Workspace {
                     })),
             )
     }
+}
+
+#[cfg(windows)]
+fn start_installer(path: &std::path::Path) -> anyhow::Result<()> {
+    crate::update::run_installer(path)
+}
+
+#[cfg(not(windows))]
+fn start_installer(_: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::bail!("updates install themselves on Windows only")
 }
 
 fn schema_nodes(names: &[String]) -> Vec<SchemaNode> {
