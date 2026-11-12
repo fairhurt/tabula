@@ -178,6 +178,17 @@ sudo apt install libfontconfig-dev libxkbcommon-x11-dev libssl-dev
 
 Saved connections live in your config folder (`tabula/connections.json`). Passwords go in the OS credential store on Windows and macOS, and in a file only you can read on Linux.
 
+## 🐘 Demo database
+
+A small seeded PostgreSQL (a shop: 2,000 customers, 500 products, 100,000 orders, a view, a function and an enum):
+
+```sh
+docker compose up -d
+tabula --url postgres://demo:tabula@localhost:5433/demo
+```
+
+Set `TABULA_DEMO_PASSWORD` in `.env` to change the password. It also creates `ai_readonly` (password `TABULA_AI_PASSWORD`, default `tabula-ai`), a read-only login you can give agents.
+
 ## 🧪 Testing
 
 ```sh

@@ -1,0 +1,30 @@
+# A small PostgreSQL with demo data, for trying Tabula.
+#
+#   docker compose up -d
+#
+# Connect with postgres://demo:<password>@<host>:5433/demo
+# (the password is TABULA_DEMO_PASSWORD in .env, or "tabula").
+# `ai_readonly` is a read-only role to give AI agents.
+services:
+  db:
+    image: postgres:17
+    container_name: tabula-demo
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: ${TABULA_DEMO_PASSWORD:-tabula}
+      POSTGRES_DB: demo
+      AI_READONLY_PASSWORD: ${TABULA_AI_PASSWORD:-tabula-ai}
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./scripts/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+      - ./scripts/demo-roles.sh:/docker-entrypoint-initdb.d/20-roles.sh:ro
+      - tabula-demo-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 5s
+      retries: 20
+
+volumes:
+  tabula-demo-data:
