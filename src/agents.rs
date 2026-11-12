@@ -41,6 +41,36 @@ impl Agent {
         }
     }
 
+    /// The key this agent's preferences are saved under.
+    pub fn key(self) -> &'static str {
+        self.command()
+    }
+
+    pub fn from_key(key: &str) -> Option<Agent> {
+        Agent::ALL.into_iter().find(|a| a.key() == key)
+    }
+
+    /// Models offered in the Ask AI panel, as (label, `--model` value). The
+    /// agent's own default is always offered too, and any other id can be typed.
+    pub fn models(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Agent::Claude => &[("Fable", "fable"), ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku")],
+            Agent::Copilot => &[("Auto", "auto")],
+        }
+    }
+
+    /// What to show for a `--model` value.
+    pub fn model_label(self, model: Option<&str>) -> String {
+        match model {
+            None => "Default model".into(),
+            Some(m) => self
+                .models()
+                .iter()
+                .find(|(_, id)| *id == m)
+                .map_or_else(|| m.to_string(), |(label, _)| label.to_string()),
+        }
+    }
+
     pub fn command(self) -> &'static str {
         match self {
             Agent::Claude => "claude",

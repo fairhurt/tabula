@@ -216,7 +216,15 @@ impl Workspace {
         let sub = cx.subscribe_in(&ai, window, |this, _, e: &AiPanelEvent, window, cx| match e {
             AiPanelEvent::Insert(sql) => this.put_sql(sql, false, window, cx),
             AiPanelEvent::Run(sql) => this.put_sql(sql, true, window, cx),
+            AiPanelEvent::Prefs => {
+                let (agent, models) = this.ai.read(cx).prefs();
+                this.settings.agent = Some(agent);
+                this.settings.models = models;
+                this.save_settings();
+            }
         });
+        let settings = if live { settings::load() } else { Settings::default() };
+        ai.update(cx, |a, _| a.set_prefs(settings.agent.as_deref(), settings.models.clone()));
         let mut conns: Vec<Conn> = profiles::load()
             .into_iter()
             .map(|p| Conn {
@@ -268,7 +276,7 @@ impl Workspace {
             exe: std::env::current_exe().unwrap_or_default(),
             focus: cx.focus_handle(),
             query_count: 0,
-            settings: if live { settings::load() } else { Settings::default() },
+            settings,
             _subs: vec![sub],
         };
         if let Some((ix, pw)) = auto {

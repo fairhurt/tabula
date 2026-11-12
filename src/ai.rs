@@ -39,6 +39,8 @@ pub struct AskRequest {
     pub history: Vec<(String, String)>,
     /// Claude Code session to continue.
     pub resume: Option<String>,
+    /// `--model` for the agent; `None` leaves the agent's own default.
+    pub model: Option<String>,
 }
 
 /// A run in progress. Dropping it does not stop the run; call [`Run::stop`].
@@ -119,6 +121,10 @@ pub fn plan(req: &AskRequest, files: &std::path::Path) -> (Vec<String>, Option<S
                 a.push("--resume".into());
                 a.push(s.clone());
             }
+            if let Some(m) = &req.model {
+                a.push("--model".into());
+                a.push(m.clone());
+            }
             (a, Some(req.prompt.clone()), writes)
         }
         Agent::Copilot => {
@@ -129,7 +135,7 @@ pub fn plan(req: &AskRequest, files: &std::path::Path) -> (Vec<String>, Option<S
                 prompt.push_str(&format!("User: {q}\n\nAssistant: {a}\n\n"));
             }
             prompt.push_str(&format!("User: {}", req.prompt));
-            let a = vec![
+            let mut a: Vec<String> = vec![
                 "-p".into(),
                 prompt,
                 "-s".into(),
@@ -143,6 +149,10 @@ pub fn plan(req: &AskRequest, files: &std::path::Path) -> (Vec<String>, Option<S
                 "--deny-tool".into(),
                 "write".into(),
             ];
+            if let Some(m) = &req.model {
+                a.push("--model".into());
+                a.push(m.clone());
+            }
             (a, None, writes)
         }
     }
@@ -367,6 +377,7 @@ mod tests {
             prompt: "how many orders?".into(),
             history: vec![("hi".into(), "hello".into())],
             resume: Some("abc".into()),
+            model: None,
         }
     }
 
@@ -379,6 +390,10 @@ mod tests {
         assert_eq!(at("--tools").as_deref(), Some(""));
         assert_eq!(at("--allowedTools").as_deref(), Some("mcp__tabula"));
         assert_eq!(at("--resume").as_deref(), Some("abc"));
+        assert_eq!(at("--model"), None);
+        let with_model = AskRequest { model: Some("opus".into()), ..req(Agent::Claude) };
+        let (a, _, _) = plan(&with_model, d.path());
+        assert!(a.windows(2).any(|w| w[0] == "--model" && w[1] == "opus"));
         assert!(a.contains(&"--strict-mcp-config".to_string()));
         let cfg: Value = serde_json::from_str(&writes[0].1).unwrap();
         assert_eq!(cfg["mcpServers"]["tabula"]["args"], json!(["mcp", "--connection", "shop db"]));
@@ -392,6 +407,10 @@ mod tests {
         assert!(a[1].contains("User: hi") && a[1].ends_with("User: how many orders?"));
         assert!(a.windows(2).any(|w| w[0] == "--deny-tool" && w[1] == "shell"));
         assert!(a.windows(2).any(|w| w[0] == "--allow-tool" && w[1] == "tabula"));
+        assert!(!a.contains(&"--model".to_string()));
+        let with_model = AskRequest { model: Some("auto".into()), ..req(Agent::Copilot) };
+        let (a, _, _) = plan(&with_model, d.path());
+        assert!(a.windows(2).any(|w| w[0] == "--model" && w[1] == "auto"));
     }
 
     #[test]

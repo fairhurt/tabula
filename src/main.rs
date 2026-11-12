@@ -8,7 +8,7 @@
 //!                                           read-only, ask, read-write)
 //!   tabula agents [connect|disconnect]      register `tabula mcp` with
 //!                                           Claude Code and Copilot CLI
-//!   tabula ask CONNECTION "question" [--copilot]
+//!   tabula ask CONNECTION "question" [--copilot] [--model M]
 //!                                           ask an agent from the terminal
 //!   tabula --screenshot DIR [--url …]       render the views headless to PNGs
 // A GUI program on Windows: no console window (except for `mcp`, which
@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some("ask") => {
             let (Some(conn), Some(prompt)) = (args.get(1), args.get(2)) else {
-                bail!("usage: tabula ask CONNECTION \"question\" [--copilot]");
+                bail!("usage: tabula ask CONNECTION \"question\" [--copilot] [--model M]");
             };
             let p = profiles::load()
                 .into_iter()
@@ -99,6 +99,7 @@ fn main() -> anyhow::Result<()> {
                 prompt: prompt.clone(),
                 history: vec![],
                 resume: None,
+                model: flag("--model"),
             });
             futures::executor::block_on(async {
                 use futures::StreamExt as _;

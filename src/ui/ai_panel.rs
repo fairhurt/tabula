@@ -8,6 +8,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     spinner::Spinner,
     text::TextView,
     v_flex,
@@ -19,6 +20,7 @@ use gpui_kit::{
     Styled as _, Subscription, Window, div,
 };
 use futures::StreamExt as _;
+use std::collections::HashMap;
 
 use super::icon;
 use crate::agents::Agent;
@@ -29,6 +31,8 @@ pub enum AiPanelEvent {
     Insert(String),
     /// Put this SQL in the active query tab and run it.
     Run(String),
+    /// The agent or a model choice changed; save them.
+    Prefs,
 }
 
 struct Msg {
@@ -49,6 +53,11 @@ pub struct AiPanel {
     /// Claude Code session, to continue the conversation.
     session: Option<String>,
     scroll: ScrollHandle,
+    /// The model picked for each agent, by [`Agent::key`]. Absent: its default.
+    models: HashMap<String, String>,
+    /// Typing a model id that isn't in the list.
+    custom_model: Entity<InputState>,
+    typing_model: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -65,6 +74,19 @@ impl AiPanel {
                 this.send_input(window, cx);
             }
         });
+        let custom_model = cx.new(|cx| InputState::new(window, cx).placeholder("Model id, then Enter"));
+        let sub2 = cx.subscribe_in(&custom_model, window, |this, input, e: &InputEvent, _, cx| match e {
+            InputEvent::PressEnter { .. } => {
+                let id = input.read(cx).value().trim().to_string();
+                this.typing_model = false;
+                this.set_model((!id.is_empty()).then_some(id), cx);
+            }
+            InputEvent::Blur => {
+                this.typing_model = false;
+                cx.notify();
+            }
+            _ => {}
+        });
         let installed: Vec<Agent> = Agent::ALL.into_iter().filter(|a| a.installed()).collect();
         AiPanel {
             agent: installed.first().copied().unwrap_or(Agent::Claude),
@@ -75,8 +97,41 @@ impl AiPanel {
             run: None,
             session: None,
             scroll: ScrollHandle::new(),
-            _subs: vec![sub],
+            models: HashMap::new(),
+            custom_model,
+            typing_model: false,
+            _subs: vec![sub, sub2],
         }
+    }
+
+    /// Restore the saved agent and model choices.
+    pub fn set_prefs(&mut self, agent: Option<&str>, models: HashMap<String, String>) {
+        if let Some(a) = agent.and_then(Agent::from_key) {
+            if self.installed.contains(&a) || self.installed.is_empty() {
+                self.agent = a;
+            }
+        }
+        self.models = models;
+    }
+
+    /// The agent in use and every model choice, for saving.
+    pub fn prefs(&self) -> (String, HashMap<String, String>) {
+        (self.agent.key().to_string(), self.models.clone())
+    }
+
+    fn model(&self) -> Option<&str> {
+        self.models.get(self.agent.key()).map(String::as_str)
+    }
+
+    /// Pick a model for the current agent; `None` is the agent's default.
+    /// The conversation carries on with the new model.
+    fn set_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        match model {
+            Some(m) => self.models.insert(self.agent.key().to_string(), m),
+            None => self.models.remove(self.agent.key()),
+        };
+        cx.emit(AiPanelEvent::Prefs);
+        cx.notify();
     }
 
     pub fn set_target(&mut self, connection: &str, database: &str, cx: &mut Context<Self>) {
@@ -146,6 +201,7 @@ impl AiPanel {
             prompt,
             history,
             resume: self.session.clone(),
+            model: self.model().map(str::to_string),
         });
         self.run = Some(run);
         cx.spawn(async move |this, cx| {
@@ -328,10 +384,53 @@ impl Render for AiPanel {
                     if this.agent != a {
                         this.agent = a;
                         this.session = None;
+                        this.typing_model = false;
+                        cx.emit(AiPanelEvent::Prefs);
                         cx.notify();
                     }
                 }))
         });
+        let agent = self.agent;
+        let current = self.model().map(str::to_string);
+        let weak = cx.entity().downgrade();
+        let model_menu = Button::new("ai-model")
+            .xsmall()
+            .ghost()
+            .icon(icon("cpu"))
+            .label(agent.model_label(current.as_deref()))
+            .tooltip("Model")
+            .dropdown_menu({
+                let current = current.clone();
+                move |menu, _, _| {
+                    let pick = |label: String, id: Option<String>| {
+                        let weak = weak.clone();
+                        PopupMenuItem::new(label)
+                            .checked(current == id)
+                            .on_click(move |_, _, cx| {
+                                let _ = weak.update(cx, |this, cx| this.set_model(id.clone(), cx));
+                            })
+                    };
+                    let mut menu = menu.item(pick(format!("Default ({}'s own)", agent.label()), None));
+                    for (label, id) in agent.models() {
+                        menu = menu.item(pick(label.to_string(), Some(id.to_string())));
+                    }
+                    // A typed id that isn't in the list stays visible and checked.
+                    if let Some(c) = current.clone().filter(|c| !agent.models().iter().any(|(_, id)| id == c)) {
+                        menu = menu.item(pick(c.clone(), Some(c)));
+                    }
+                    let weak = weak.clone();
+                    menu.separator().item(PopupMenuItem::new("Other model…").on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.typing_model = true;
+                            this.custom_model.update(cx, |i, cx| {
+                                i.set_value("", window, cx);
+                                i.focus(window, cx);
+                            });
+                            cx.notify();
+                        });
+                    }))
+                }
+            });
         let messages: Vec<_> = self
             .messages
             .iter()
@@ -362,7 +461,10 @@ impl Render for AiPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                     ),
             )
-            .child(h_flex().px_3().py_1().gap_1().children(agents))
+            .child(h_flex().px_3().py_1().gap_1().children(agents).child(div().flex_1()).child(model_menu))
+            .when(self.typing_model, |d| {
+                d.child(div().px_3().pb_1().child(Input::new(&self.custom_model).small()))
+            })
             .child(
                 div()
                     .px_3()
