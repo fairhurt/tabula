@@ -1425,7 +1425,7 @@ impl Workspace {
             .items_center()
             .justify_center()
             .gap_4()
-            .child(icon("database").size(px(48.)).text_color(theme.primary.opacity(0.7)))
+            .child(gpui_kit::img(super::logo()).size(super::rem(84.)))
             .child(div().text_xl().font_semibold().child("Tabula"))
             .child(
                 div()

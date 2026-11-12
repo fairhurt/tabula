@@ -22,6 +22,11 @@ interprocess = "2.4"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 url = "2"
 
+[build-dependencies]
+resvg = { version = "0.45", default-features = false }
+ico = "0.4"
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 

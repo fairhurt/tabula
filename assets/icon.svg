@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Tabula: a table whose first cell is a ringed planet. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e3a8a"/>
+      <stop offset="0.55" stop-color="#172554"/>
+      <stop offset="1" stop-color="#0b1020"/>
+    </linearGradient>
+    <radialGradient id="planet" cx="0.36" cy="0.3" r="0.85">
+      <stop offset="0" stop-color="#dbeafe"/>
+      <stop offset="0.4" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </radialGradient>
+    <linearGradient id="grid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bfdbfe"/>
+      <stop offset="1" stop-color="#60a5fa"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="6" width="244" height="244" rx="58" fill="url(#bg)"/>
+  <rect x="6.5" y="6.5" width="243" height="243" rx="57.5" fill="none" stroke="#3b82f6" stroke-opacity="0.45" stroke-width="3"/>
+
+  <!-- stars -->
+  <g fill="#e0f2fe">
+    <path d="M196 40l4 11 11 4-11 4-4 11-4-11-11-4 11-4z"/>
+    <circle cx="222" cy="92" r="4"/>
+    <circle cx="156" cy="34" r="3" fill-opacity="0.7"/>
+    <circle cx="36" cy="150" r="3" fill-opacity="0.6"/>
+  </g>
+
+  <!-- the table -->
+  <g fill="none" stroke="url(#grid)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="50" y="96" width="156" height="116" rx="18"/>
+    <path d="M50 136H206M50 174H206M102 136V212M154 96V212"/>
+  </g>
+
+  <!-- the planet, sitting where the first cell would be -->
+  <g transform="translate(92 88) rotate(-18)">
+    <ellipse rx="62" ry="17" fill="none" stroke="#fcd34d" stroke-width="8"/>
+    <circle r="40" fill="#172554"/>
+    <circle r="34" fill="url(#planet)"/>
+    <path d="M-62 0A62 17 0 0 0 62 0" fill="none" stroke="#fcd34d" stroke-width="8" stroke-linecap="round"/>
+  </g>
+</svg>

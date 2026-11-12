@@ -52,6 +52,18 @@ pub fn c(hex: u32) -> Hsla {
     rgb(hex).into()
 }
 
+/// The app icon (rendered from `assets/icon.svg` by build.rs).
+pub fn logo() -> Arc<gpui_kit::Image> {
+    static LOGO: std::sync::OnceLock<Arc<gpui_kit::Image>> = std::sync::OnceLock::new();
+    LOGO.get_or_init(|| {
+        Arc::new(gpui_kit::Image::from_bytes(
+            gpui_kit::ImageFormat::Png,
+            include_bytes!(concat!(env!("OUT_DIR"), "/icon.png")).to_vec(),
+        ))
+    })
+    .clone()
+}
+
 /// A length that follows the text size: `v` is its pixel size at 13px text.
 pub fn rem(v: f32) -> Rems {
     rems(v / 13.)
@@ -140,6 +152,7 @@ pub fn run(url: Option<String>) -> anyhow::Result<()> {
                         ..Default::default()
                     }),
                     window_min_size: Some(size(px(800.), px(500.))),
+                    app_id: Some("tabula".into()),
                     ..Default::default()
                 },
                 cx,
