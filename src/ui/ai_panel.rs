@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use super::icon;
 use crate::agents::Agent;
 use crate::ai::{self, AiEvent, AskRequest, Run};
+use crate::profiles::{Engine, Profile};
 
 pub enum AiPanelEvent {
     /// Put this SQL in the active query tab.
@@ -42,11 +43,20 @@ struct Msg {
     error: Option<String>,
 }
 
+#[derive(Clone, PartialEq)]
+struct Target {
+    connection: String,
+    engine: Engine,
+    database: String,
+    /// As shown under the agent picker.
+    title: String,
+}
+
 pub struct AiPanel {
     agent: Agent,
     installed: Vec<Agent>,
-    /// Connection name and database the chat is about.
-    target: Option<(String, String)>,
+    /// The connection the chat is about.
+    target: Option<Target>,
     messages: Vec<Msg>,
     input: Entity<InputState>,
     run: Option<Run>,
@@ -196,8 +206,13 @@ impl AiPanel {
         cx.notify();
     }
 
-    pub fn set_target(&mut self, connection: &str, database: &str, cx: &mut Context<Self>) {
-        let t = Some((connection.to_string(), database.to_string()));
+    pub fn set_target(&mut self, profile: &Profile, cx: &mut Context<Self>) {
+        let t = Some(Target {
+            connection: profile.name.clone(),
+            engine: profile.engine,
+            database: profile.database_label(),
+            title: profile.title(),
+        });
         if self.target != t {
             self.target = t;
             // A new database is a new conversation.
@@ -226,7 +241,7 @@ impl AiPanel {
         if self.run.is_some() {
             return;
         }
-        let Some((connection, database)) = self.target.clone() else {
+        let Some(target) = self.target.clone() else {
             self.messages.push(Msg {
                 user: false,
                 text: String::new(),
@@ -258,8 +273,9 @@ impl AiPanel {
         });
         let (mut rx, run) = ai::ask(AskRequest {
             agent: self.agent,
-            connection,
-            database,
+            connection: target.connection,
+            engine: target.engine,
+            database: target.database,
             prompt,
             history,
             resume: self.session.clone(),
@@ -536,7 +552,7 @@ impl Render for AiPanel {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(match &self.target {
-                        Some((c, d)) => format!("On {c} · {d} · uses your {} sign-in", self.agent.label()),
+                        Some(t) => format!("On {} · uses your {} sign-in", t.title, self.agent.label()),
                         None => "Connect to a database to start".into(),
                     }),
             )

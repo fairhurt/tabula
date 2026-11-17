@@ -23,6 +23,7 @@ use super::grid::{self, GridRequest, ResultGrid};
 use super::query::QueryEvent;
 use super::{CopySelection, EditCell, SaveChanges, icon};
 use crate::db::{self, DbObject, EditTarget, ObjectKind, Session};
+use crate::profiles::Engine;
 use crate::rt;
 
 const PAGE: usize = 500;
@@ -71,13 +72,17 @@ impl DataTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let example = match session.profile.engine {
+            Engine::Postgres => "e.g. status = 'paid' AND placed_at > now() - interval '1 day'",
+            Engine::Sqlite => "e.g. status = 'paid' AND placed_at > datetime('now', '-1 day')",
+        };
         let filter = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("sql")
                 .soft_wrap(false)
                 // Enter applies the filter instead of adding a line.
                 .submit_on_enter(true)
-                .placeholder("e.g. status = 'paid' AND placed_at > now() - interval '1 day'")
+                .placeholder(example)
         });
         super::sql_complete::attach(&filter, &session, Some((object.schema.clone(), object.name.clone())), cx);
         let cell_input = cx.new(|cx| InputState::new(window, cx));
@@ -185,7 +190,7 @@ impl DataTab {
                         } else {
                             let (key, input) = (this.key.clone(), this.cell_input.clone());
                             this.table.update(cx, |t, _| t.delegate_mut().enable_editing(key, input));
-                            Editing::On(EditTarget::new(this.object.qualified(), &info.columns))
+                            Editing::On(EditTarget::new(this.session.profile.engine, this.object.qualified(), &info.columns))
                         }
                     }
                 };

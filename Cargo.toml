@@ -1,6 +1,6 @@
 [package]
 name = "tabula"
-description = "A PostgreSQL viewer and query tool built with GPUI Kit, with an MCP server so AI agents can use it."
+description = "A PostgreSQL and SQLite viewer and query tool built with GPUI Kit, with an MCP server so AI agents can use it."
 version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -27,6 +27,8 @@ sha2 = "0.10"
 # The same version the editor uses, for its completion types.
 lsp-types = { version = "0.97", features = ["proposed"] }
 github-copilot-sdk = { version = "1.0.31", default-features = false, features = ["runtime"] }
+# SQLite itself is compiled in, so there is nothing to install.
+rusqlite = { version = "0.43", features = ["bundled", "column_decltype", "hooks", "limits"] }
 
 [build-dependencies]
 resvg = { version = "0.45", default-features = false }

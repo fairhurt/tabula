@@ -4,13 +4,14 @@
 
 # Tabula
 
-**A fast, native PostgreSQL client — that your AI agents can use too.**
+**A fast, native PostgreSQL and SQLite client — that your AI agents can use too.**
 
 In the spirit of pgAdmin and HeidiSQL, built in Rust with [GPUI Kit](https://gpui-kit.com).
 Claude Code and GitHub Copilot CLI can explore and query your databases through Tabula, on your own subscription.
 
 ![Rust](https://img.shields.io/badge/Rust-1.97+-b7410e?logo=rust&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-tested%20on%2017-336791?logo=postgresql&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-built%20in-003b57?logo=sqlite&logoColor=white)
 ![GPUI Kit](https://img.shields.io/badge/UI-GPUI%20Kit-2563eb)
 ![MCP](https://img.shields.io/badge/MCP-server-6d28d9)
 
@@ -38,7 +39,7 @@ Tabula checks for a newer release when it starts. When there is one, the status 
 <td width="50%" valign="top">
 
 ### 🗂️ Browse everything
-Connections → databases → schemas → tables, views, materialized views, functions and sequences, with row estimates. Double-click a table to page through its rows; right-click anything for more.
+Connections → databases → schemas → tables, views, materialized views, functions and sequences, with row estimates. A SQLite file opens the same way, its tables right under the connection. Double-click a table to page through its rows; right-click anything for more.
 
 </td>
 <td width="50%" valign="top">
@@ -58,7 +59,7 @@ The Ask AI panel runs Claude Code or Copilot CLI with Tabula's tools, so answers
 <td width="50%" valign="top">
 
 ### 🛡️ Safe by default
-Agents get read-only access, enforced by PostgreSQL itself. Writes can wait for your one-click approval. Agents never see passwords.
+Agents get read-only access, enforced by the database itself. Writes can wait for your one-click approval. Agents never see passwords.
 
 </td>
 </tr>
@@ -93,6 +94,27 @@ Right-click a schema and pick **Schema map** (or use the orbit button above the 
 ## 🕘 Query history
 
 Every statement you run from a query tab is remembered, with when it ran, how long it took and whether it failed. <kbd>Ctrl</kbd>+<kbd>H</kbd> opens the history: type to search, <kbd>Enter</kbd> puts a query back in the editor, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs it again. It is kept in `tabula/history.jsonl` beside your connections (the latest 1,000).
+
+## 🪶 SQLite
+
+Open a database file from **New connection** → **SQLite** (there is a Browse button), or straight from the terminal:
+
+```sh
+tabula --url sqlite:/path/to/app.db     # or just: tabula --url ./app.db
+```
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/sqlite-dark.png">
+  <img src="docs/sqlite-light.png" alt="A SQLite file open in Tabula, browsing its orders table">
+</picture>
+
+Everything else works the same: Data with in-place editing, Structure, the schema map (right-click the connection or a group), query tabs with completion, Stop and Plan (`EXPLAIN QUERY PLAN`), history, Ask AI and the agent tools. SQLite is built in, so there is nothing to install. A few things follow from how SQLite works:
+
+- The file has to exist; Tabula won't create an empty database from a mistyped path.
+- Row counts in the tree come from `ANALYZE`, so a database that never ran it shows none.
+- Constraints have no names in SQLite's catalog, so Structure lists them by their columns. The CREATE statement is the one you wrote, `CHECK`s included.
+- Foreign keys are enforced on Tabula's connections. `PRAGMA foreign_keys = OFF` in a query tab turns that off for your queries until you reconnect.
+- Edits are saved as plain values and the column's type decides how they are stored, as with any SQLite statement. BLOBs show as `x'…'` hex; one longer than 256 bytes is shown cut short and can't be saved from the grid.
 
 ## 🤖 Ask AI
 
@@ -142,7 +164,7 @@ The same dialog sets how the connection is secured:
 | AI access | Agents can… |
 | --- | --- |
 | **Off** | Nothing — the connection is hidden from them |
-| **Read only** *(default)* | Read, one statement at a time, in a read-only transaction with a 30 s timeout |
+| **Read only** *(default)* | Read, one statement at a time, with a 30 s timeout: in a read-only transaction on PostgreSQL, on a read-only connection on SQLite |
 | **Ask for writes** | Read, and propose writes that you allow once or decline in Tabula |
 | **Read & write** | Run anything — for throwaway databases |
 
@@ -164,7 +186,7 @@ The same dialog sets how the connection is secured:
 </table>
 
 > [!NOTE]
-> Read-only is enforced by PostgreSQL, not by parsing SQL, and a multi-statement escape like `SELECT 1; COMMIT; DELETE …` is rejected. A read-only transaction still lets functions such as `pg_terminate_backend` run, so for production also give the connection a read-only database role.
+> Read-only is enforced by the database, not by parsing SQL, and a multi-statement escape like `SELECT 1; COMMIT; DELETE …` is rejected. On PostgreSQL, a read-only transaction still lets functions such as `pg_terminate_backend` run, so for production also give the connection a read-only database role. On SQLite, agents read through a connection opened read-only that can't attach other files, so `ATTACH` and `VACUUM INTO` are no way around it.
 
 ## ⌨️ Shortcuts
 
@@ -189,6 +211,7 @@ On macOS, use <kbd>Cmd</kbd> instead of <kbd>Ctrl</kbd>.
 ```text
 tabula                                  open the app
 tabula --url postgres://…               open the app and connect
+tabula --url sqlite:/path/to/file.db    the same for a SQLite file (or just its path)
 tabula --connect NAME                   open the app on a saved connection
 tabula add NAME URL [--ai MODE]         save a connection (off, read-only, ask, read-write)
 tabula agents [connect|disconnect]      register `tabula mcp` with Claude Code and Copilot CLI
@@ -201,7 +224,7 @@ Or register by hand: `claude mcp add tabula -- /path/to/tabula mcp`.
 
 ## 🛠️ Building
 
-Rust 1.97 or newer.
+Rust 1.97 or newer, and a C compiler (SQLite is compiled in).
 
 ```sh
 cargo build --release
@@ -251,6 +274,13 @@ tabula --url postgres://demo:tabula@localhost:5433/demo
 
 Set `TABULA_DEMO_PASSWORD` in `.env` to change the password. It also creates `ai_readonly` (password `TABULA_AI_PASSWORD`, default `tabula-ai`), a read-only login you can give agents.
 
+The same shop as a SQLite file:
+
+```sh
+sqlite3 shop.db < scripts/seed-sqlite.sql
+tabula --url sqlite:shop.db
+```
+
 ## 🧪 Testing
 
 ```sh
@@ -262,4 +292,4 @@ cargo run -- --screenshot shots --url postgres://postgres:tabula@localhost/postg
 
 `cargo test -- --ignored copilot` asks a signed-in Copilot for its model list, and `TABULA_AI_DEBUG=1 tabula ask NAME "question" --copilot` prints every event the SDK sends.
 
-Database and MCP tests skip without `TABULA_TEST_URL`. `TABULA_TEST_CONNECTION=name` runs the database test on a saved connection instead, taking its password from the credential store. The screenshots above come from `--screenshot` against `scripts/seed.sql`; headless rendering needs macOS or Linux.
+The PostgreSQL database and MCP tests skip without `TABULA_TEST_URL`; the SQLite ones build their own database from `scripts/seed-sqlite.sql` and always run. `TABULA_TEST_CONNECTION=name` runs the PostgreSQL database test on a saved connection instead, taking its password from the credential store. The screenshots above come from `--screenshot` against the two seed files; headless rendering needs macOS or Linux.

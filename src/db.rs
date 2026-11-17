@@ -1,39 +1,40 @@
-//! PostgreSQL access: connecting, the catalog, and running SQL.
+//! Database access: connecting, the catalog, and running SQL.
 //!
-//! Everything here is async on tokio (see [`crate::rt`]). Ad-hoc SQL goes
-//! through the simple-query protocol, so every value comes back as text and
-//! any type displays without per-type decoding.
+//! [`Session`] is what the rest of Tabula talks to. Behind it is one of two
+//! backends, [`postgres`] or [`sqlite`], picked by the profile's engine.
+//! Everything here is async on tokio (see [`crate::rt`]), and every value
+//! comes back as text, so any type displays without per-type decoding.
 
+mod postgres;
+pub(crate) mod sqlite;
+
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context as _, anyhow, bail};
-use futures::{StreamExt as _, pin_mut};
 use serde::Serialize;
-use tokio_postgres::{CancelToken, Client, Config, NoTls, SimpleQueryMessage};
 
-use crate::profiles::{Profile, SslMode};
+use crate::profiles::{Engine, Profile};
 
 /// One column of a result.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResultColumn {
     pub name: String,
-    /// The type name, when known (single statements only).
+    /// The type name, when known: PostgreSQL's for a single statement,
+    /// SQLite's declared type for a column that comes straight from a table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_name: Option<String>,
+    /// Holds numbers, which read best right-aligned.
+    #[serde(skip)]
+    pub numeric: bool,
 }
 
 impl ResultColumn {
-    /// Numbers read best right-aligned.
     pub fn is_numeric(&self) -> bool {
-        matches!(
-            self.type_name.as_deref(),
-            Some(
-                "int2" | "int4" | "int8" | "float4" | "float8" | "numeric" | "oid" | "money"
-            )
-        )
+        self.numeric
     }
 }
+
 
 /// The outcome of one statement.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -119,7 +120,8 @@ pub struct DbObject {
     pub schema: String,
     pub name: String,
     pub kind: ObjectKind,
-    /// The planner's estimate (`reltuples`), when known.
+    /// The planner's estimate (PostgreSQL's `reltuples`, SQLite's count as
+    /// of the last `ANALYZE`), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_estimate: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,8 +179,8 @@ pub struct TableInfo {
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<IndexInfo>,
     pub constraints: Vec<ConstraintInfo>,
-    /// CREATE statement (tables are reconstructed; views and functions come
-    /// from the server).
+    /// CREATE statement (PostgreSQL tables are reconstructed; everything
+    /// else is the database's own text).
     pub ddl: String,
 }
 
@@ -235,37 +237,58 @@ pub enum Change {
     Delete { key: Vec<Cell> },
 }
 
+impl Change {
+    /// Every cell the change names: the key's, then the new values.
+    pub(crate) fn cells(&self) -> impl Iterator<Item = &Cell> {
+        let (key, values): (&[Cell], &[Cell]) = match self {
+            Change::Update { key, set } => (key, set),
+            Change::Insert { values } => (&[], values),
+            Change::Delete { key } => (key, &[]),
+        };
+        key.iter().chain(values)
+    }
+}
+
 /// The table edits apply to: its quoted name and each column's type.
 #[derive(Debug, Clone, Default)]
 pub struct EditTarget {
+    pub engine: Engine,
     pub qualified: String,
-    pub types: std::collections::HashMap<String, String>,
+    pub types: HashMap<String, String>,
 }
 
 impl EditTarget {
-    pub fn new(qualified: String, columns: &[ColumnInfo]) -> EditTarget {
+    pub fn new(engine: Engine, qualified: String, columns: &[ColumnInfo]) -> EditTarget {
         EditTarget {
+            engine,
             qualified,
             types: columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect(),
         }
     }
 
-    /// `value::type`, with the value written by `value` (a literal or `$n`).
+    /// The type `column` was declared with.
+    pub(crate) fn declared(&self, column: &str) -> Option<&str> {
+        self.types.get(column).map(String::as_str)
+    }
+
+    /// The value written by `value` (a literal or a placeholder), as the
+    /// column's type. PostgreSQL needs the cast, `value::type`; in SQLite
+    /// the column's affinity converts what it is given.
     fn typed(&self, column: &str, value: String) -> String {
-        match self.types.get(column) {
-            Some(t) => format!("{value}::{t}"),
-            None => value,
+        match (self.engine, self.types.get(column)) {
+            (Engine::Postgres, Some(t)) => format!("{value}::{t}"),
+            _ => value,
         }
     }
 
-    /// The statement for `change`. `value` renders each value in turn: a
-    /// `$n::text` placeholder when it will be bound, or a literal to show it.
-    fn sql(&self, change: &Change, mut value: impl FnMut(&Option<String>) -> String) -> String {
+    /// The statement for `change`. `value` renders each column's value in
+    /// turn: a placeholder when it will be bound, or a literal to show it.
+    fn sql(&self, change: &Change, mut value: impl FnMut(&str, &Option<String>) -> String) -> String {
         let mut assign = |cells: &[Cell], sep: &str, null_safe: bool| -> String {
             cells
                 .iter()
                 .map(|(c, v)| {
-                    let rhs = self.typed(c, value(v));
+                    let rhs = self.typed(c, value(c, v));
                     if null_safe && v.is_none() {
                         format!("{} IS NULL", quote_ident(c))
                     } else {
@@ -288,32 +311,47 @@ impl EditTarget {
             }
             Change::Insert { values } => {
                 let cols: Vec<String> = values.iter().map(|(c, _)| quote_ident(c)).collect();
-                let vals: Vec<String> = values.iter().map(|(c, v)| self.typed(c, value(v))).collect();
+                let vals: Vec<String> = values.iter().map(|(c, v)| self.typed(c, value(c, v))).collect();
                 format!("INSERT INTO {} ({}) VALUES ({})", self.qualified, cols.join(", "), vals.join(", "))
+            }
+        }
+    }
+
+    /// A value as a literal in the engine's own syntax.
+    fn literal(&self, column: &str, value: &Option<String>) -> String {
+        let quoted = || value.as_deref().map_or("NULL".to_string(), quote_literal);
+        match self.engine {
+            Engine::Postgres => quoted(),
+            Engine::Sqlite => {
+                let declared = self.declared(column);
+                // A blob shown cut short can't be read back; saving refuses
+                // it, so here it only has to show what the grid shows.
+                sqlite::EditValue::read(declared, value.as_deref()).map_or_else(|_| quoted(), |v| v.literal(declared))
             }
         }
     }
 
     /// `change` as SQL with the values written in, to show before saving.
     pub fn preview(&self, change: &Change) -> String {
-        let sql = self.sql(change, |v| match v {
-            Some(v) => quote_literal(v),
-            None => "NULL".into(),
-        });
+        let sql = self.sql(change, |column, v| self.literal(column, v));
         format!("{sql};")
     }
 
-    /// `change` with `$n` placeholders, and the values to bind to them. A
-    /// NULL in a key becomes `IS NULL` and binds nothing.
-    fn bound(&self, change: &Change) -> (String, Vec<Option<String>>) {
-        let mut params: Vec<Option<String>> = vec![];
+    /// `change` with placeholders (`$n` for PostgreSQL, `?n` for SQLite), and
+    /// the cells to bind to them. A NULL in a key becomes `IS NULL` and binds
+    /// nothing.
+    pub(crate) fn bound(&self, change: &Change) -> (String, Vec<Cell>) {
+        let mut params: Vec<Cell> = vec![];
         let key_nulls: usize = match change {
             Change::Update { key, .. } | Change::Delete { key } => key.iter().filter(|(_, v)| v.is_none()).count(),
             Change::Insert { .. } => 0,
         };
-        let sql = self.sql(change, |v| {
-            params.push(v.clone());
-            format!("${}::text", params.len())
+        let sql = self.sql(change, |column, v| {
+            params.push((column.to_string(), v.clone()));
+            match self.engine {
+                Engine::Postgres => format!("${}::text", params.len()),
+                Engine::Sqlite => format!("?{}", params.len()),
+            }
         });
         if key_nulls == 0 {
             return (sql, params);
@@ -323,104 +361,83 @@ impl EditTarget {
     }
 }
 
-/// A database error with the server's detail, hint and position.
-pub fn describe_error(e: &tokio_postgres::Error) -> String {
-    let Some(db) = e.as_db_error() else {
-        let mut s = e.to_string();
-        let mut src = std::error::Error::source(e);
-        while let Some(inner) = src {
-            s.push_str(&format!(": {inner}"));
-            src = inner.source();
-        }
-        return s;
-    };
-    let mut s = format!("{}: {}", db.severity(), db.message());
-    if let Some(d) = db.detail() {
-        s.push_str(&format!("\nDETAIL: {d}"));
+/// The error for a write that a read-only session turned down: PostgreSQL's
+/// read-only transaction (SQLSTATE 25006) or SQLite's read-only connection.
+#[derive(Debug)]
+pub struct WriteRefused(pub String);
+
+impl std::fmt::Display for WriteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
-    if let Some(h) = db.hint() {
-        s.push_str(&format!("\nHINT: {h}"));
-    }
-    if let Some(tokio_postgres::error::ErrorPosition::Original(p)) = db.position() {
-        s.push_str(&format!("\nat character {p}"));
-    }
-    s.push_str(&format!(" (SQLSTATE {})", db.code().code()));
-    s
 }
 
-fn pg(e: tokio_postgres::Error) -> anyhow::Error {
-    anyhow!(describe_error(&e))
+impl std::error::Error for WriteRefused {}
+
+/// Whether `e` is a write that failed only for want of write access.
+pub fn needs_write_access(e: &anyhow::Error) -> bool {
+    e.is::<WriteRefused>()
 }
 
-async fn open(profile: &Profile, password: Option<&str>) -> anyhow::Result<Client> {
-    let mut cfg = Config::new();
-    cfg.host(&profile.host)
-        .port(profile.port)
-        .user(&profile.user)
-        .dbname(&profile.database)
-        .application_name("tabula")
-        .connect_timeout(Duration::from_secs(10));
-    if let Some(pw) = password {
-        cfg.password(pw);
+enum Backend {
+    // Boxed: two clients make it several times the size of the other.
+    Postgres(Box<postgres::Backend>),
+    Sqlite(sqlite::Backend),
+}
+
+/// Stops the query running on a session's work connection.
+pub enum Canceller {
+    Postgres(tokio_postgres::CancelToken),
+    Sqlite(sqlite::Stop),
+}
+
+impl Canceller {
+    pub async fn cancel(self) -> anyhow::Result<()> {
+        match self {
+            Canceller::Postgres(token) => token.cancel_query(tokio_postgres::NoTls).await?,
+            Canceller::Sqlite(stop) => stop.stop(),
+        }
+        Ok(())
     }
-    let client = match profile.ssl {
-        SslMode::Disable => {
-            let (client, conn) = cfg.connect(NoTls).await.map_err(pg)?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            client
-        }
-        mode => {
-            cfg.ssl_mode(if mode == SslMode::Prefer {
-                tokio_postgres::config::SslMode::Prefer
-            } else {
-                tokio_postgres::config::SslMode::Require
-            });
-            // libpq's `prefer` and `require` encrypt without verifying the
-            // certificate; match that. `verify` checks the certificate
-            // against this computer's trusted roots, and the host name.
-            let verify = mode == SslMode::Verify;
-            let tls = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(!verify)
-                .danger_accept_invalid_hostnames(!verify)
-                .build()
-                .context("TLS setup failed")?;
-            let tls = postgres_native_tls::MakeTlsConnector::new(tls);
-            let (client, conn) = cfg.connect(tls).await.map_err(pg)?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            client
-        }
-    };
-    Ok(client)
 }
 
-/// An open connection to one database: one client for the catalog and one
-/// for user queries, so a long query never blocks the object tree.
+/// An open connection to one database. Each backend keeps the catalog and
+/// the user's queries on separate connections, so a long query never blocks
+/// the object tree.
 pub struct Session {
     pub profile: Profile,
     password: Option<String>,
-    meta: Client,
-    work: Client,
+    backend: Backend,
+    /// The server's version, or the version of the built-in SQLite.
     pub server_version: String,
+}
+
+/// Call the same method on whichever backend the session has.
+macro_rules! backend {
+    ($session:expr, $b:ident => $call:expr) => {
+        match &$session.backend {
+            Backend::Postgres($b) => $call,
+            Backend::Sqlite($b) => $call,
+        }
+    };
 }
 
 impl Session {
     pub async fn connect(profile: Profile, password: Option<String>) -> anyhow::Result<Arc<Session>> {
-        let meta = open(&profile, password.as_deref()).await?;
-        let work = open(&profile, password.as_deref()).await?;
-        let server_version = meta
-            .query_one("SELECT current_setting('server_version')", &[])
-            .await
-            .map_err(pg)?
-            .get::<_, String>(0);
+        let (backend, server_version) = match profile.engine {
+            Engine::Postgres => {
+                let (b, v) = postgres::Backend::connect(&profile, password.as_deref()).await?;
+                (Backend::Postgres(Box::new(b)), v)
+            }
+            Engine::Sqlite => {
+                let (b, v) = sqlite::Backend::connect(&profile.database).await?;
+                (Backend::Sqlite(b), v)
+            }
+        };
         Ok(Arc::new(Session {
             profile,
             password,
-            meta,
-            work,
+            backend,
             server_version,
         }))
     }
@@ -430,175 +447,35 @@ impl Session {
         Session::connect(self.profile.with_database(database), self.password.clone()).await
     }
 
-    /// A token that stops the query running on the work connection.
-    pub fn cancel_token(&self) -> CancelToken {
-        self.work.cancel_token()
+    /// Something that stops the query running on the work connection.
+    pub fn canceller(&self) -> Canceller {
+        match &self.backend {
+            Backend::Postgres(b) => Canceller::Postgres(b.cancel_token()),
+            Backend::Sqlite(b) => Canceller::Sqlite(b.stop_handle()),
+        }
     }
 
+    /// The databases to offer next to this one. A SQLite file is the only one.
     pub async fn databases(&self) -> anyhow::Result<Vec<String>> {
-        let rows = self
-            .meta
-            .query(
-                "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname",
-                &[],
-            )
-            .await
-            .map_err(pg)?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
+        match &self.backend {
+            Backend::Postgres(b) => b.databases().await,
+            Backend::Sqlite(_) => Ok(vec![self.profile.database.clone()]),
+        }
     }
 
-    /// User schemas first, then the system ones.
+    /// User schemas first, then the system ones. SQLite has `main`.
     pub async fn schemas(&self) -> anyhow::Result<Vec<String>> {
-        let rows = self
-            .meta
-            .query(
-                "SELECT nspname FROM pg_namespace
-                 WHERE nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%'
-                 ORDER BY nspname IN ('pg_catalog', 'information_schema'), nspname",
-                &[],
-            )
-            .await
-            .map_err(pg)?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
+        backend!(self, b => b.schemas().await)
     }
 
     pub async fn objects(&self, schema: &str) -> anyhow::Result<Vec<DbObject>> {
-        let mut out = Vec::new();
-        let rels = self
-            .meta
-            .query(
-                "SELECT c.relname, c.relkind::text,
-                        CASE WHEN c.reltuples >= 0 THEN c.reltuples::int8 END,
-                        obj_description(c.oid, 'pg_class')
-                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f','S')
-                 ORDER BY c.relname",
-                &[&schema],
-            )
-            .await
-            .map_err(pg)?;
-        for r in rels {
-            let kind = match r.get::<_, String>(1).as_str() {
-                "r" | "p" => ObjectKind::Table,
-                "v" => ObjectKind::View,
-                "m" => ObjectKind::MaterializedView,
-                "f" => ObjectKind::ForeignTable,
-                _ => ObjectKind::Sequence,
-            };
-            out.push(DbObject {
-                schema: schema.to_string(),
-                name: r.get(0),
-                kind,
-                rows_estimate: r.get(2),
-                comment: r.get(3),
-                signature: None,
-            });
-        }
-        let funcs = self
-            .meta
-            .query(
-                "SELECT p.proname, pg_get_function_identity_arguments(p.oid),
-                        obj_description(p.oid, 'pg_proc')
-                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname = $1 AND p.prokind IN ('f', 'p')
-                 ORDER BY p.proname",
-                &[&schema],
-            )
-            .await
-            .map_err(pg)?;
-        for r in funcs {
-            out.push(DbObject {
-                schema: schema.to_string(),
-                name: r.get(0),
-                kind: ObjectKind::Function,
-                rows_estimate: None,
-                comment: r.get(2),
-                signature: Some(r.get(1)),
-            });
-        }
-        Ok(out)
+        backend!(self, b => b.objects(schema).await)
     }
 
     /// Every table and view in a schema with its columns, and the foreign
     /// keys between them: what the schema map draws.
     pub async fn schema_map(&self, schema: &str) -> anyhow::Result<(Vec<MapTable>, Vec<ForeignKey>)> {
-        let rows = self
-            .meta
-            .query(
-                "SELECT c.relname, c.relkind::text,
-                        CASE WHEN c.reltuples >= 0 THEN c.reltuples::int8 END,
-                        a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
-                        COALESCE(a.attnum = ANY(i.indkey), false)
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-                 LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
-                 WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f')
-                 ORDER BY c.relname, a.attnum",
-                &[&schema],
-            )
-            .await
-            .map_err(pg)?;
-        let mut tables: Vec<MapTable> = vec![];
-        for r in rows {
-            let name: String = r.get(0);
-            if tables.last().is_none_or(|t| t.name != name) {
-                tables.push(MapTable {
-                    name,
-                    kind: match r.get::<_, String>(1).as_str() {
-                        "v" => ObjectKind::View,
-                        "m" => ObjectKind::MaterializedView,
-                        "f" => ObjectKind::ForeignTable,
-                        _ => ObjectKind::Table,
-                    },
-                    rows_estimate: r.get(2),
-                    columns: vec![],
-                });
-            }
-            tables.last_mut().expect("just pushed").columns.push(MapColumn {
-                name: r.get(3),
-                data_type: r.get(4),
-                nullable: r.get(5),
-                primary_key: r.get(6),
-            });
-        }
-        let cols = |rel: &str, keys: &str| {
-            format!(
-                "ARRAY(SELECT a.attname::text FROM unnest(con.{keys}) WITH ORDINALITY k(attnum, ord)
-                       JOIN pg_attribute a ON a.attrelid = con.{rel} AND a.attnum = k.attnum ORDER BY k.ord)"
-            )
-        };
-        let rows = self
-            .meta
-            .query(
-                &format!(
-                    "SELECT con.conname::text, c.relname::text, fn.nspname::text, fc.relname::text, {}, {}
-                     FROM pg_constraint con
-                     JOIN pg_class c ON c.oid = con.conrelid
-                     JOIN pg_namespace n ON n.oid = c.relnamespace
-                     JOIN pg_class fc ON fc.oid = con.confrelid
-                     JOIN pg_namespace fn ON fn.oid = fc.relnamespace
-                     WHERE con.contype = 'f' AND n.nspname = $1
-                     ORDER BY c.relname, con.conname",
-                    cols("conrelid", "conkey"),
-                    cols("confrelid", "confkey")
-                ),
-                &[&schema],
-            )
-            .await
-            .map_err(pg)?;
-        let keys = rows
-            .into_iter()
-            .map(|r| ForeignKey {
-                name: r.get(0),
-                from_table: r.get(1),
-                to_schema: r.get(2),
-                to_table: r.get(3),
-                from_cols: r.get(4),
-                to_cols: r.get(5),
-            })
-            .collect();
-        Ok((tables, keys))
+        backend!(self, b => b.schema_map(schema).await)
     }
 
     /// The names SQL completion suggests: every table and view in the
@@ -626,326 +503,69 @@ impl Session {
 
     /// Columns, indexes, constraints and DDL for a table or view.
     pub async fn table_info(&self, schema: &str, name: &str) -> anyhow::Result<TableInfo> {
-        let rel = self
-            .meta
-            .query_opt(
-                "SELECT c.oid, c.relkind::text, obj_description(c.oid, 'pg_class'),
-                        CASE WHEN c.reltuples >= 0 THEN c.reltuples::int8 END,
-                        pg_size_pretty(pg_total_relation_size(c.oid))
-                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relname = $2",
-                &[&schema, &name],
-            )
-            .await
-            .map_err(pg)?
-            .ok_or_else(|| anyhow!("no table or view named {schema}.{name}"))?;
-        let oid: u32 = rel.get(0);
-        let kind = match rel.get::<_, String>(1).as_str() {
-            "v" => ObjectKind::View,
-            "m" => ObjectKind::MaterializedView,
-            "f" => ObjectKind::ForeignTable,
-            "S" => ObjectKind::Sequence,
-            _ => ObjectKind::Table,
-        };
-        let cols = self
-            .meta
-            .query(
-                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
-                        pg_get_expr(d.adbin, d.adrelid),
-                        COALESCE(a.attnum = ANY(i.indkey), false),
-                        col_description(a.attrelid, a.attnum)
-                 FROM pg_attribute a
-                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                 LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
-                 WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
-                 ORDER BY a.attnum",
-                &[&oid],
-            )
-            .await
-            .map_err(pg)?;
-        let columns: Vec<ColumnInfo> = cols
-            .iter()
-            .map(|r| ColumnInfo {
-                name: r.get(0),
-                data_type: r.get(1),
-                nullable: r.get(2),
-                default: r.get(3),
-                primary_key: r.get(4),
-                comment: r.get(5),
-            })
-            .collect();
-        let indexes = self
-            .meta
-            .query(
-                "SELECT ic.relname, pg_get_indexdef(i.indexrelid), i.indisunique, i.indisprimary
-                 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
-                 WHERE i.indrelid = $1 ORDER BY i.indisprimary DESC, ic.relname",
-                &[&oid],
-            )
-            .await
-            .map_err(pg)?
-            .iter()
-            .map(|r| IndexInfo {
-                name: r.get(0),
-                definition: r.get(1),
-                unique: r.get(2),
-                primary: r.get(3),
-            })
-            .collect::<Vec<_>>();
-        let constraints = self
-            .meta
-            .query(
-                "SELECT conname, contype::text, pg_get_constraintdef(oid)
-                 FROM pg_constraint WHERE conrelid = $1
-                 ORDER BY CASE contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 WHEN 'f' THEN 2 ELSE 3 END, conname",
-                &[&oid],
-            )
-            .await
-            .map_err(pg)?
-            .iter()
-            .map(|r| ConstraintInfo {
-                name: r.get(0),
-                kind: r.get(1),
-                definition: r.get(2),
-            })
-            .collect::<Vec<_>>();
-        let qualified = format!("{}.{}", quote_ident(schema), quote_ident(name));
-        let ddl = match kind {
-            ObjectKind::View | ObjectKind::MaterializedView => {
-                let def: String = self
-                    .meta
-                    .query_one("SELECT pg_get_viewdef($1::oid, true)", &[&oid])
-                    .await
-                    .map_err(pg)?
-                    .get(0);
-                let what = if kind == ObjectKind::View {
-                    "VIEW"
-                } else {
-                    "MATERIALIZED VIEW"
-                };
-                format!("CREATE {what} {qualified} AS\n{}", def.trim_end())
-            }
-            _ => table_ddl(&qualified, &columns, &constraints, &indexes),
-        };
-        Ok(TableInfo {
-            schema: schema.to_string(),
-            name: name.to_string(),
-            kind,
-            comment: rel.get(2),
-            rows_estimate: rel.get(3),
-            total_size: rel.get(4),
-            columns,
-            indexes,
-            constraints,
-            ddl,
-        })
+        backend!(self, b => b.table_info(schema, name).await)
     }
 
-    /// The `CREATE FUNCTION` statement for a function.
+    /// The `CREATE FUNCTION` statement for a function (PostgreSQL only;
+    /// SQLite's catalog has no functions to list).
     pub async fn function_ddl(&self, schema: &str, name: &str, args: &str) -> anyhow::Result<String> {
-        let sig = format!("{}.{}({args})", quote_ident(schema), quote_ident(name));
-        let row = self
-            .meta
-            .query_one(
-                "SELECT pg_get_functiondef(to_regprocedure($1))",
-                &[&sig],
-            )
-            .await
-            .map_err(pg)?;
-        row.get::<_, Option<String>>(0)
-            .ok_or_else(|| anyhow!("function {sig} not found"))
+        match &self.backend {
+            Backend::Postgres(b) => b.function_ddl(schema, name, args).await,
+            Backend::Sqlite(_) => anyhow::bail!("SQLite has no stored functions"),
+        }
     }
 
     /// Apply row edits in one transaction: all of them, or none. An update
     /// or delete that doesn't hit exactly one row stops and rolls back. Runs
-    /// on the catalog connection, so it never joins a transaction the user
+    /// off the work connection, so it never joins a transaction the user
     /// opened in a query tab. Returns how many rows changed.
     pub async fn apply(&self, target: &EditTarget, changes: &[Change]) -> anyhow::Result<u64> {
-        if changes.is_empty() {
-            return Ok(0);
-        }
-        self.meta.batch_execute("BEGIN").await.map_err(pg)?;
-        let mut total = 0;
-        for (i, change) in changes.iter().enumerate() {
-            let (sql, params) = target.bound(change);
-            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-            let done = match self.meta.execute(sql.as_str(), &refs).await {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = self.meta.batch_execute("ROLLBACK").await;
-                    return Err(anyhow!("change {} of {} failed, nothing was saved: {}\n{}", i + 1, changes.len(), describe_error(&e), target.preview(change)));
-                }
-            };
-            if done != 1 && !matches!(change, Change::Insert { .. }) {
-                let _ = self.meta.batch_execute("ROLLBACK").await;
-                return Err(anyhow!(
-                    "change {} of {} matched {done} rows instead of 1 (the row may have changed or gone), nothing was saved:\n{}",
-                    i + 1,
-                    changes.len(),
-                    target.preview(change)
-                ));
-            }
-            total += done;
-        }
-        self.meta.batch_execute("COMMIT").await.map_err(pg)?;
-        Ok(total)
+        backend!(self, b => b.apply(target, changes).await)
     }
 
     /// Run `sql` (any number of statements) on the work connection, keeping
     /// at most `max_rows` rows per statement.
     pub async fn run(&self, sql: &str, max_rows: usize) -> anyhow::Result<QueryOutcome> {
-        run_on(&self.work, sql, max_rows).await
+        backend!(self, b => b.run(sql, max_rows).await)
     }
 
-    /// Run one statement inside a read-only transaction with a timeout, on
-    /// the catalog connection. For AI agents: a write fails, and so does
-    /// anything that is not exactly one statement.
+    /// Run one statement read-only with a timeout. For AI agents: a write
+    /// fails (see [`needs_write_access`]), and so does anything that is not
+    /// exactly one statement. PostgreSQL enforces it with a read-only
+    /// transaction, SQLite with a connection opened read-only.
     pub async fn run_read_only(
         &self,
         sql: &str,
         max_rows: usize,
         timeout: Duration,
     ) -> anyhow::Result<QueryOutcome> {
-        // The extended protocol takes exactly one statement, so this is what
-        // stops `SELECT 1; COMMIT; DELETE …` from escaping the transaction.
-        self.meta
-            .prepare(sql)
-            .await
-            .map_err(|e| anyhow!("{} (agents run one statement at a time)", describe_error(&e)))?;
-        if is_transaction_control(sql) {
-            bail!("transaction control statements aren't allowed in read-only mode");
-        }
-        self.meta
-            .batch_execute(&format!(
-                "BEGIN READ ONLY; SET LOCAL statement_timeout = {}; SELECT 1",
-                timeout.as_millis()
-            ))
-            .await
-            .map_err(pg)?;
-        let out = run_on(&self.meta, sql, max_rows).await;
-        let _ = self.meta.batch_execute("ROLLBACK").await;
-        out
+        backend!(self, b => b.run_read_only(sql, max_rows, timeout).await)
     }
 
-    /// Run any single statement on the catalog connection with a timeout, for
-    /// AI agents with write access.
+    /// Run `sql` with a timeout, off the work connection, for AI agents with
+    /// write access.
     pub async fn run_write(
         &self,
         sql: &str,
         max_rows: usize,
         timeout: Duration,
     ) -> anyhow::Result<QueryOutcome> {
-        self.meta
-            .batch_execute(&format!("SET statement_timeout = {}", timeout.as_millis()))
-            .await
-            .map_err(pg)?;
-        let out = run_on(&self.meta, sql, max_rows).await;
-        let _ = self.meta.batch_execute("RESET statement_timeout").await;
-        out
+        backend!(self, b => b.run_write(sql, max_rows, timeout).await)
     }
 
-}
+    /// The plan for `sql` as text, run read-only. With `analyze`, PostgreSQL
+    /// runs the statement and reports actual timings.
+    pub async fn plan(&self, sql: &str, analyze: bool, timeout: Duration) -> anyhow::Result<String> {
+        backend!(self, b => b.plan(sql, analyze, timeout).await)
+    }
 
-/// The error a read-only transaction gives for a write (SQLSTATE 25006).
-pub fn needs_write_access(e: &anyhow::Error) -> bool {
-    e.to_string().contains("SQLSTATE 25006")
-}
-
-fn is_transaction_control(sql: &str) -> bool {
-    let first = sql
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        first.as_str(),
-        "begin" | "commit" | "rollback" | "end" | "abort" | "start" | "savepoint" | "release" | "prepare" | "set"
-            | "reset" | "discard"
-    )
-}
-
-async fn run_on(client: &Client, sql: &str, max_rows: usize) -> anyhow::Result<QueryOutcome> {
-    let started = Instant::now();
-    // Column types, when the text is a single statement the server can plan.
-    let types: Option<Vec<String>> = match client.prepare(sql).await {
-        Ok(stmt) => Some(stmt.columns().iter().map(|c| c.type_().name().to_string()).collect()),
-        Err(_) => None,
-    };
-    let stream = client.simple_query_raw(sql).await.map_err(pg)?;
-    pin_mut!(stream);
-    let mut results = Vec::new();
-    let mut cur = ResultSet::default();
-    while let Some(msg) = stream.next().await {
-        match msg.map_err(pg)? {
-            SimpleQueryMessage::RowDescription(cols) => {
-                cur.columns = cols
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| ResultColumn {
-                        name: c.name().to_string(),
-                        type_name: types.as_ref().and_then(|t| t.get(i).cloned()),
-                    })
-                    .collect();
-            }
-            SimpleQueryMessage::Row(row) => {
-                if cur.rows.len() < max_rows {
-                    cur.rows
-                        .push((0..row.len()).map(|i| row.get(i).map(str::to_string)).collect());
-                } else {
-                    cur.truncated = true;
-                }
-            }
-            SimpleQueryMessage::CommandComplete(n) => {
-                cur.row_count = n;
-                results.push(std::mem::take(&mut cur));
-            }
-            _ => {}
+    /// The statement that shows the plan for `sql` as rows.
+    pub fn explain_sql(&self, sql: &str) -> String {
+        match self.profile.engine {
+            Engine::Postgres => format!("EXPLAIN {sql}"),
+            Engine::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
         }
     }
-    Ok(QueryOutcome {
-        results,
-        elapsed: started.elapsed(),
-    })
-}
-
-/// A readable CREATE TABLE built from the catalog.
-fn table_ddl(
-    qualified: &str,
-    columns: &[ColumnInfo],
-    constraints: &[ConstraintInfo],
-    indexes: &[IndexInfo],
-) -> String {
-    let mut lines: Vec<String> = columns
-        .iter()
-        .map(|c| {
-            let mut l = format!("    {} {}", quote_ident(&c.name), c.data_type);
-            if let Some(d) = &c.default {
-                l.push_str(&format!(" DEFAULT {d}"));
-            }
-            if !c.nullable {
-                l.push_str(" NOT NULL");
-            }
-            l
-        })
-        .collect();
-    for k in constraints.iter().filter(|k| k.kind != "n") {
-        lines.push(format!(
-            "    CONSTRAINT {} {}",
-            quote_ident(&k.name),
-            k.definition
-        ));
-    }
-    let mut s = format!("CREATE TABLE {qualified} (\n{}\n);", lines.join(",\n"));
-    // Indexes that back a constraint are already covered above.
-    for i in indexes {
-        if constraints.iter().any(|k| k.name == i.name) {
-            continue;
-        }
-        s.push_str(&format!("\n{};", i.definition));
-    }
-    s
 }
 
 /// Rows of `object`, a page at a time, for the Data tab.
@@ -1058,6 +678,7 @@ mod tests {
 
     fn target() -> EditTarget {
         EditTarget {
+            engine: Engine::Postgres,
             qualified: "\"shop\".\"products\"".into(),
             types: [("id", "integer"), ("title", "text"), ("price", "numeric(10,2)")]
                 .into_iter()
@@ -1083,7 +704,9 @@ mod tests {
             sql,
             "UPDATE \"shop\".\"products\" SET \"title\" = $1::text::text, \"price\" = $2::text::numeric(10,2) WHERE \"id\" = $3::text::integer"
         );
-        assert_eq!(params, vec![Some("It's new".to_string()), None, Some("7".to_string())]);
+        let values: Vec<Option<&str>> = params.iter().map(|(_, v)| v.as_deref()).collect();
+        assert_eq!(values, vec![Some("It's new"), None, Some("7")]);
+        assert_eq!(params[2].0, "id");
 
         assert_eq!(t.preview(&Change::Delete { key }), "DELETE FROM \"shop\".\"products\" WHERE \"id\" = '7'::integer;");
         assert_eq!(t.preview(&Change::Insert { values: vec![] }), "INSERT INTO \"shop\".\"products\" DEFAULT VALUES;");
@@ -1095,21 +718,49 @@ mod tests {
     }
 
     #[test]
+    fn changes_become_sqlite_sql() {
+        let t = EditTarget {
+            engine: Engine::Sqlite,
+            qualified: "\"main\".\"products\"".into(),
+            types: [("id", "INTEGER"), ("title", "TEXT"), ("price", "NUMERIC"), ("photo", "BLOB")]
+                .into_iter()
+                .map(|(c, t)| (c.to_string(), t.to_string()))
+                .collect(),
+        };
+        let cell = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+        let update = Change::Update {
+            key: vec![cell("id", Some("7"))],
+            set: vec![cell("title", Some("It's new")), cell("price", None), cell("photo", Some("x'00FF'"))],
+        };
+        // No casts: SQLite has none to give, and a column's affinity does the converting.
+        assert_eq!(
+            t.preview(&update),
+            "UPDATE \"main\".\"products\" SET \"title\" = 'It''s new', \"price\" = NULL, \"photo\" = x'00FF' WHERE \"id\" = 7;"
+        );
+        let (sql, params) = t.bound(&update);
+        assert_eq!(
+            sql,
+            "UPDATE \"main\".\"products\" SET \"title\" = ?1, \"price\" = ?2, \"photo\" = ?3 WHERE \"id\" = ?4"
+        );
+        assert_eq!(params.len(), 4);
+        assert_eq!(
+            t.preview(&Change::Insert { values: vec![cell("title", Some("Mug")), cell("price", Some("4.50"))] }),
+            "INSERT INTO \"main\".\"products\" (\"title\", \"price\") VALUES ('Mug', 4.50);"
+        );
+        let (sql, params) = t.bound(&Change::Delete { key: vec![cell("id", None)] });
+        assert_eq!(sql, "DELETE FROM \"main\".\"products\" WHERE \"id\" IS NULL");
+        assert!(params.is_empty());
+    }
+
+    #[test]
     fn csv_and_tsv() {
         let cols = vec![
-            ResultColumn { name: "a".into(), type_name: None },
-            ResultColumn { name: "b".into(), type_name: None },
+            ResultColumn { name: "a".into(), type_name: None, numeric: false },
+            ResultColumn { name: "b".into(), type_name: None, numeric: false },
         ];
         let rows = vec![vec![Some("x,y".into()), None], vec![Some("q\"".into()), Some("t\tu".into())]];
         assert_eq!(to_csv(&cols, &rows), "a,b\r\n\"x,y\",\r\n\"q\"\"\",t\tu\r\n");
         assert_eq!(to_tsv(&cols, &rows), "a\tb\nx,y\t\nq\"\tt u");
-    }
-
-    #[test]
-    fn spots_transaction_control_and_writes() {
-        assert!(is_transaction_control("  COMMIT"));
-        assert!(is_transaction_control("set role postgres"));
-        assert!(!is_transaction_control("select 1"));
     }
 
     /// Needs a server: `TABULA_TEST_URL=postgres://postgres:tabula@localhost/postgres`,
@@ -1124,7 +775,7 @@ mod tests {
         }
         let url = std::env::var("TABULA_TEST_URL").ok()?;
         let (p, pw) = Profile::from_url("test", &url).unwrap();
-        let p = Profile { ssl: SslMode::Disable, ..p };
+        let p = Profile { ssl: crate::profiles::SslMode::Disable, ..p };
         Some(crate::rt::block_on(Session::connect(p, pw)).expect("connect"))
     }
 
@@ -1196,11 +847,13 @@ mod tests {
             assert_eq!(fk("order_items", "products").from_cols, vec!["product_id"]);
 
             // Row edits, on a table only this connection sees.
-            s.meta
-                .batch_execute("create temp table tabula_edit (id serial primary key, title text not null, price numeric(10,2), tags text[])")
+            // (`run_write` and `apply` share the connection the temp table lives on.)
+            let wait = Duration::from_secs(5);
+            s.run_write("create temp table tabula_edit (id serial primary key, title text not null, price numeric(10,2), tags text[])", 1, wait)
                 .await
                 .unwrap();
             let t = EditTarget {
+                engine: Engine::Postgres,
                 qualified: "tabula_edit".into(),
                 types: [("id", "integer"), ("title", "text"), ("price", "numeric(10,2)"), ("tags", "text[]")]
                     .into_iter()
@@ -1218,11 +871,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(n, 4);
-            let rows = s.meta.query("select id, title, price::text, tags::text from tabula_edit", &[]).await.unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].get::<_, String>(1), "It's a mug");
-            assert_eq!(rows[0].get::<_, Option<String>>(2), None);
-            assert_eq!(rows[0].get::<_, String>(3), "{a,b}");
+            let rows = s.run_write("select id, title, price, tags from tabula_edit", 10, wait).await.unwrap();
+            assert_eq!(
+                rows.results[0].rows,
+                vec![vec![Some("1".into()), Some("It's a mug".into()), None, Some("{a,b}".into())]]
+            );
 
             // One bad change undoes the good ones before it.
             let err = s
@@ -1241,8 +894,365 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("matched 0 rows"), "{err}");
-            let row = s.meta.query_one("select title from tabula_edit", &[]).await.unwrap();
-            assert_eq!(row.get::<_, String>(0), "It's a mug");
+            let row = s.run_write("select title from tabula_edit", 10, wait).await.unwrap();
+            assert_eq!(row.results[0].rows, vec![vec![Some("It's a mug".into())]]);
         });
+    }
+
+    fn sqlite_session() -> (tempfile::TempDir, Arc<Session>) {
+        let (dir, path) = sqlite::demo_database();
+        let s = crate::rt::block_on(Session::connect(Profile::sqlite("shop", &path), None)).expect("connect");
+        (dir, s)
+    }
+
+    #[test]
+    fn sqlite_catalog() {
+        let (_dir, s) = sqlite_session();
+        crate::rt::block_on(async {
+            assert!(s.server_version.starts_with("3."), "{}", s.server_version);
+            assert_eq!(s.databases().await.unwrap(), vec![s.profile.database.clone()]);
+            assert_eq!(s.schemas().await.unwrap(), vec!["main"]);
+
+            let objs = s.objects("main").await.unwrap();
+            let names: Vec<_> = objs.iter().map(|o| (o.name.as_str(), o.kind)).collect();
+            assert_eq!(
+                names,
+                vec![
+                    ("customers", ObjectKind::Table),
+                    ("order_items", ObjectKind::Table),
+                    ("order_totals", ObjectKind::View),
+                    ("orders", ObjectKind::Table),
+                    ("products", ObjectKind::Table),
+                ],
+                "sqlite_stat1 and friends stay hidden"
+            );
+            // The seed ends with ANALYZE, so there are counts to show.
+            assert_eq!(objs[3].rows_estimate, Some(100_000));
+            assert_eq!(objs[2].rows_estimate, None);
+
+            let info = s.table_info("main", "orders").await.unwrap();
+            assert_eq!(info.kind, ObjectKind::Table);
+            assert_eq!(info.rows_estimate, Some(100_000));
+            let col = |n: &str| info.columns.iter().find(|c| c.name == n).unwrap();
+            assert!(col("id").primary_key && col("id").data_type == "INTEGER" && !col("id").nullable);
+            assert!(!col("customer_id").nullable && col("note").nullable);
+            assert_eq!(col("status").default.as_deref(), Some("'pending'"));
+            let index = |n: &str| info.indexes.iter().find(|i| i.name == n).unwrap();
+            assert_eq!(
+                index("orders_customer_idx").definition,
+                "CREATE INDEX orders_customer_idx ON orders(customer_id)"
+            );
+            let kinds: Vec<_> = info.constraints.iter().map(|k| (k.kind.as_str(), k.definition.as_str())).collect();
+            assert_eq!(
+                kinds,
+                vec![("p", "PRIMARY KEY (id)"), ("f", "FOREIGN KEY (customer_id) REFERENCES customers (id)")]
+            );
+            assert!(info.ddl.starts_with("CREATE TABLE orders ("), "{}", info.ddl);
+            assert!(info.ddl.contains("CHECK (status IN"), "{}", info.ddl);
+            assert!(info.ddl.ends_with("ON orders(placed_at DESC);"), "{}", info.ddl);
+
+            // Keys SQLite indexes on its own, and a cascading composite key.
+            let info = s.table_info("main", "order_items").await.unwrap();
+            assert!(info.indexes[0].primary);
+            assert_eq!(info.indexes[0].definition, "PRIMARY KEY (order_id, product_id)");
+            let defs: Vec<_> = info.constraints.iter().map(|k| k.definition.as_str()).collect();
+            assert!(defs.contains(&"PRIMARY KEY (order_id, product_id)"), "{defs:?}");
+            assert!(defs.contains(&"FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE"), "{defs:?}");
+            let info = s.table_info("main", "customers").await.unwrap();
+            assert!(info.constraints.iter().any(|k| k.kind == "u" && k.definition == "UNIQUE (email)"));
+
+            let view = s.table_info("main", "order_totals").await.unwrap();
+            assert_eq!(view.kind, ObjectKind::View);
+            assert!(view.ddl.starts_with("CREATE VIEW order_totals AS"), "{}", view.ddl);
+            assert_eq!(view.columns.len(), 4);
+
+            assert!(s.table_info("main", "nope").await.is_err());
+        });
+    }
+
+    #[test]
+    fn sqlite_queries() {
+        let (_dir, s) = sqlite_session();
+        crate::rt::block_on(async {
+            let out = s.run("select 1 as a, null as b; select id from orders", 10).await.unwrap();
+            assert_eq!(out.results.len(), 2);
+            assert_eq!(out.results[0].rows, vec![vec![Some("1".into()), None]]);
+            assert!(out.results[1].truncated);
+            assert_eq!(out.results[1].rows.len(), 10);
+            assert_eq!(out.results[1].row_count, 100_000);
+
+            // Numbers are spotted by value; text is not, whatever the column says.
+            let typed = s
+                .run("select id, price, title, count(*) over () as n, price * 2 as twice, sku || 'x' from products", 5)
+                .await
+                .unwrap();
+            let cols = &typed.results[0].columns;
+            assert_eq!(cols[1].type_name.as_deref(), Some("NUMERIC"));
+            assert_eq!(cols[3].type_name, None);
+            let numeric: Vec<bool> = cols.iter().map(ResultColumn::is_numeric).collect();
+            assert_eq!(numeric, vec![true, true, false, true, true, false]);
+            let empty = s.run("select id, title from products where 0", 5).await.unwrap();
+            assert!(empty.results[0].has_rows() && empty.results[0].rows.is_empty());
+            assert!(empty.results[0].columns[0].is_numeric() && !empty.results[0].columns[1].is_numeric());
+
+            // Writes report what they changed; DDL changes no rows.
+            let out = s
+                .run("create table t (x); insert into t values (1), (2), (3); update t set x = 0 where x > 1; drop table t", 10)
+                .await
+                .unwrap();
+            let counts: Vec<u64> = out.results.iter().map(|r| r.row_count).collect();
+            assert_eq!(counts, vec![0, 3, 2, 0]);
+            assert!(out.results.iter().all(|r| !r.has_rows()));
+
+            // The page of rows the Data tab asks for.
+            let orders = DbObject {
+                schema: "main".into(),
+                name: "orders".into(),
+                kind: ObjectKind::Table,
+                rows_estimate: None,
+                comment: None,
+                signature: None,
+            };
+            let page = s.run(&browse_sql(&orders, "status = 'paid'", Some(("id", false)), &[], 3, 3), 3).await.unwrap();
+            let ids: Vec<_> = page.results[0].rows.iter().map(|r| r[0].clone().unwrap()).collect();
+            assert_eq!(ids, vec!["99985", "99981", "99977"]);
+
+            // Foreign keys are enforced, and a transaction can span runs.
+            let err = s.run("delete from customers where id = 1", 1).await.unwrap_err();
+            assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+            s.run("begin; update orders set note = 'x' where id = 1", 1).await.unwrap();
+            s.run("rollback", 1).await.unwrap();
+            let note = s.run("select note from orders where id = 1", 1).await.unwrap();
+            assert_eq!(note.results[0].rows, vec![vec![None]]);
+
+            let err = s.run("select * from nope", 10).await.unwrap_err();
+            assert_eq!(err.to_string(), "no such table: nope");
+            let err = s.run("select 1;\nselect * frm orders", 10).await.unwrap_err();
+            assert_eq!(err.to_string(), "near \"frm\": syntax error\nat character 20");
+
+            let plan = s.run(&s.explain_sql("select * from orders where customer_id = 7"), 10).await.unwrap();
+            let detail = plan.results[0].rows[0].last().cloned().flatten().unwrap();
+            assert!(detail.contains("orders_customer_idx"), "{detail}");
+        });
+    }
+
+    #[test]
+    fn sqlite_read_only_is_enforced_by_sqlite() {
+        let (dir, s) = sqlite_session();
+        crate::rt::block_on(async {
+            let t = Duration::from_secs(5);
+            let n = s.run_read_only("select count(*) from orders", 10, t).await.unwrap();
+            assert_eq!(n.results[0].rows[0][0].as_deref(), Some("100000"));
+
+            // Writes of every shape are refused, in the way that can ask for approval.
+            for sql in [
+                "delete from orders",
+                "insert into orders (customer_id) values (1) returning id",
+                "with d as (select 1) update orders set note = 'x'",
+                "create table t (x)",
+                "drop view order_totals",
+                "pragma journal_mode = wal",
+                "vacuum",
+            ] {
+                let err = s.run_read_only(sql, 10, t).await.unwrap_err();
+                assert!(needs_write_access(&err), "{sql}: {err}");
+            }
+
+            // One statement means one, and nothing of a batch runs.
+            let err = s.run_read_only("select 1; delete from orders", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("one statement"), "{err}");
+            let err = s.run_read_only("select 1; select 2", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("one statement"), "{err}");
+            assert!(s.run_read_only("select 1; -- just a comment", 10, t).await.is_ok());
+
+            // No way out through another file, and no switching the guard off.
+            let other = dir.path().join("other.db");
+            let attach = format!("attach database 'file:{}?mode=rwc' as o", other.display());
+            let err = s.run_read_only(&attach, 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("can't be attached"), "{err}");
+            let into = format!("vacuum into '{}'", other.display());
+            assert!(s.run_read_only(&into, 10, t).await.is_err());
+            assert!(!other.exists());
+            assert!(s.run_read_only("select load_extension('x')", 10, t).await.is_err());
+            s.run_read_only("pragma query_only = off", 10, t).await.unwrap();
+            let err = s.run_read_only("delete from orders", 10, t).await.unwrap_err();
+            assert!(needs_write_access(&err), "{err}");
+
+            // A transaction can't be left open to pin an old snapshot.
+            let err = s.run_read_only("begin", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("rolled back"), "{err}");
+            s.run("update orders set note = 'seen' where id = 2", 1).await.unwrap();
+            let seen = s.run_read_only("select note from orders where id = 2", 1, t).await.unwrap();
+            assert_eq!(seen.results[0].rows[0][0].as_deref(), Some("seen"));
+
+            // Still all there.
+            let n = s.run("select count(*) from orders", 1).await.unwrap();
+            assert_eq!(n.results[0].rows[0][0].as_deref(), Some("100000"));
+
+            let join = "select * from orders o join customers c on c.id = o.customer_id where c.id = 7";
+            let plan = s.plan(join, true, t).await.unwrap();
+            assert!(plan.contains("orders_customer_idx") && plan.contains("no EXPLAIN ANALYZE"), "{plan}");
+        });
+    }
+
+    #[test]
+    fn sqlite_agent_writes_stops_and_timeouts() {
+        let (_dir, s) = sqlite_session();
+        crate::rt::block_on(async {
+            let t = Duration::from_secs(5);
+            let out = s.run_write("update orders set note = 'agent' where id <= 3", 10, t).await.unwrap();
+            assert_eq!(out.results[0].row_count, 3);
+            // The user's connection sees it at once.
+            let n = s.run("select count(*) from orders where note = 'agent'", 1).await.unwrap();
+            assert_eq!(n.results[0].rows[0][0].as_deref(), Some("3"));
+
+            // A transaction left open would lock the file for everyone else.
+            let err = s.run_write("begin; delete from order_items", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("rolled back"), "{err}");
+            s.run("update orders set note = null where id <= 3", 1).await.unwrap();
+            let n = s.run("select count(*) from order_items", 1).await.unwrap();
+            assert_eq!(n.results[0].rows[0][0].as_deref(), Some("100000"));
+
+            let forever = "with recursive g(n) as (select 1 union all select n + 1 from g) select count(*) from g";
+            let started = std::time::Instant::now();
+            let err = s.run_read_only(forever, 10, Duration::from_millis(200)).await.unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            // The limit goes with the call, not the connection.
+            assert!(s.run_read_only("select count(*) from orders", 10, t).await.is_ok());
+
+            let stop = s.canceller();
+            let running = tokio::spawn({
+                let s = s.clone();
+                async move { s.run(forever, 10).await }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.cancel().await.unwrap();
+            let err = running.await.unwrap().unwrap_err();
+            assert_eq!(err.to_string(), "the query was stopped");
+            assert!(s.run("select 1", 1).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn sqlite_schema_map_and_completion() {
+        let (_dir, s) = sqlite_session();
+        crate::rt::block_on(async {
+            s.run(
+                "create table Refunds (id integer primary key, order_ref integer references ORDERS, item_order, item_product,
+                   foreign key (item_order, item_product) references order_items)",
+                1,
+            )
+            .await
+            .unwrap();
+            let (tables, keys) = s.schema_map("main").await.unwrap();
+            let orders = tables.iter().find(|t| t.name == "orders").unwrap();
+            assert_eq!(orders.rows_estimate, Some(100_000));
+            assert!(orders.columns.iter().any(|c| c.name == "id" && c.primary_key && !c.nullable));
+            assert!(tables.iter().any(|t| t.name == "order_totals" && t.kind == ObjectKind::View));
+            let fk = |from: &str, to: &str| keys.iter().find(|k| k.from_table == from && k.to_table == to).unwrap();
+            assert_eq!(fk("orders", "customers").from_cols, vec!["customer_id"]);
+            assert_eq!(fk("orders", "customers").to_cols, vec!["id"]);
+            assert_eq!(fk("orders", "customers").name, "orders_customer_id_fkey");
+            assert_eq!(fk("order_items", "orders").to_schema, "main");
+            assert_eq!(fk("order_items", "products").from_cols, vec!["product_id"]);
+            // A key that names no columns means the parent's primary key, and
+            // the parent is found whatever case it was written in.
+            assert_eq!(fk("Refunds", "orders").to_cols, vec!["id"]);
+            assert_eq!(fk("Refunds", "order_items").from_cols, vec!["item_order", "item_product"]);
+            assert_eq!(fk("Refunds", "order_items").to_cols, vec!["order_id", "product_id"]);
+
+            let catalog = s.completion_catalog().await.unwrap();
+            assert_eq!(catalog.schemas, vec!["main"]);
+            let (_, found) = crate::complete::suggest(&catalog, "select o.cu from orders o", 11, None);
+            assert_eq!(found[0].insert, "customer_id");
+        });
+    }
+
+    #[test]
+    fn sqlite_row_edits() {
+        let (_dir, s) = sqlite_session();
+        crate::rt::block_on(async {
+            s.run("create table edit (id integer primary key, title text not null, price numeric, photo blob, extra)", 1)
+                .await
+                .unwrap();
+            let info = s.table_info("main", "edit").await.unwrap();
+            let t = EditTarget::new(Engine::Sqlite, "\"main\".\"edit\"".into(), &info.columns);
+            let cell = |c: &str, v: Option<&str>| (c.to_string(), v.map(str::to_string));
+            let n = s
+                .apply(&t, &[
+                    Change::Insert {
+                        values: vec![cell("title", Some("Mug")), cell("price", Some("4.50")), cell("photo", Some("x'00FF'"))],
+                    },
+                    Change::Insert { values: vec![cell("title", Some("Cup"))] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("It's a mug")), cell("extra", Some("7"))] },
+                    Change::Delete { key: vec![cell("id", Some("2"))] },
+                ])
+                .await
+                .unwrap();
+            assert_eq!(n, 4);
+            // Numbers went in as numbers, the blob as a blob, and text stayed text.
+            let rows = s
+                .run("select id, title, price, typeof(price), photo, typeof(photo), extra, typeof(extra) from edit", 10)
+                .await
+                .unwrap();
+            let expect = ["1", "It's a mug", "4.5", "real", "x'00FF'", "blob", "7", "text"];
+            assert_eq!(rows.results[0].rows, vec![expect.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()]);
+
+            // One bad change undoes the good ones before it.
+            let err = s
+                .apply(&t, &[
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("changed"))] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", None)] },
+                ])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("change 2 of 2 failed") && err.to_string().contains("NOT NULL"), "{err}");
+            assert!(err.to_string().contains("nothing was saved"), "{err}");
+            let err = s
+                .apply(&t, &[
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("changed"))] },
+                    Change::Delete { key: vec![cell("id", Some("99"))] },
+                ])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("matched 0 rows"), "{err}");
+            // A blob too long for the grid is refused, not saved as its preview.
+            let long = format!("x'{}…' (300 bytes)", "07".repeat(256));
+            let err = s
+                .apply(&t, &[Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("photo", Some(&long))] }])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("cut short"), "{err}");
+            let row = s.run("select title, photo from edit", 10).await.unwrap();
+            assert_eq!(row.results[0].rows, vec![vec![Some("It's a mug".into()), Some("x'00FF'".into())]]);
+            // The connection is left ready for the next save.
+            let ok = [Change::Delete { key: vec![cell("id", Some("1"))] }];
+            assert_eq!(s.apply(&t, &ok).await.unwrap(), 1);
+
+            // Edits respect foreign keys, like the user's own statements.
+            let orders = s.table_info("main", "orders").await.unwrap();
+            let t = EditTarget::new(Engine::Sqlite, "\"main\".\"orders\"".into(), &orders.columns);
+            let orphan = [Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("customer_id", Some("999999"))] }];
+            let err = s.apply(&t, &orphan).await.unwrap_err();
+            assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+        });
+    }
+
+    #[test]
+    fn sqlite_wants_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let connect = |path: &std::path::Path| {
+            crate::rt::block_on(Session::connect(Profile::sqlite("x", path.to_str().unwrap()), None))
+        };
+        let missing = dir.path().join("missing.db");
+        let err = connect(&missing).err().unwrap();
+        assert!(format!("{err:#}").contains("unable to open database file"), "{err:#}");
+        assert!(!missing.exists(), "connecting must not create the file");
+
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "this is not a database, it is a text file that is long enough").unwrap();
+        let err = connect(&text).err().unwrap();
+        assert!(format!("{err:#}").contains("not a database"), "{err:#}");
     }
 }

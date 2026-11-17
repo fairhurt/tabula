@@ -18,11 +18,10 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use tokio_postgres::CancelToken;
 
 use super::grid::{self, ResultGrid};
 use super::{AskAiInEditor, CopySelection, RunQuery, ToggleHistory, icon};
-use crate::db::{ResultSet, Session};
+use crate::db::{Canceller, ResultSet, Session};
 use crate::rt;
 
 /// Rows kept per statement.
@@ -47,7 +46,7 @@ pub struct QueryTab {
     results: Vec<ResultSet>,
     shown: usize,
     running: bool,
-    cancel: Option<CancelToken>,
+    cancel: Option<Canceller>,
     error: Option<String>,
     summary: Option<String>,
     last_sql: String,
@@ -200,7 +199,7 @@ impl QueryTab {
         self.error = None;
         self.summary = None;
         self.last_sql = sql.clone();
-        self.cancel = Some(self.session.cancel_token());
+        self.cancel = Some(self.session.canceller());
         self.table.update(cx, |t, cx| {
             t.delegate_mut().set_loading(true);
             t.refresh(cx);
@@ -283,13 +282,8 @@ impl QueryTab {
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(token) = self.cancel.take() {
-            let _ = rt::spawn(async move {
-                token
-                    .cancel_query(tokio_postgres::NoTls)
-                    .await
-                    .map_err(anyhow::Error::from)
-            });
+        if let Some(cancel) = self.cancel.take() {
+            let _ = rt::spawn(cancel.cancel());
             cx.emit(QueryEvent::Status("Cancelling…".into()));
         }
     }
@@ -300,7 +294,8 @@ impl QueryTab {
         if sql.is_empty() {
             return;
         }
-        self.run_sql(format!("EXPLAIN {sql}"), false, cx);
+        let explain = self.session.explain_sql(sql);
+        self.run_sql(explain, false, cx);
     }
 
     fn ask_ai(&mut self, what: AiAsk, cx: &mut Context<Self>) {
@@ -355,7 +350,7 @@ impl QueryTab {
                     .ghost()
                     .icon(icon("list-tree"))
                     .label("Plan")
-                    .tooltip("Show PostgreSQL's plan (EXPLAIN)")
+                    .tooltip("Show the database's plan for this query (EXPLAIN)")
                     .disabled(self.running)
                     .on_click(cx.listener(|this, _, _, cx| this.explain(cx))),
             )
@@ -402,10 +397,7 @@ impl QueryTab {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{} · {}",
-                        self.session.profile.name, self.session.profile.database
-                    )),
+                    .child(self.session.profile.title()),
             )
     }
 

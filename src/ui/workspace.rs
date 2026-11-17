@@ -35,7 +35,7 @@ use crate::agents::{Agent, McpStatus};
 use crate::db::{DbObject, ObjectKind, Session};
 use crate::history::History;
 use crate::link::{self, LinkReply, LinkRequest};
-use crate::profiles::{self, AiAccess, Profile};
+use crate::profiles::{self, AiAccess, Engine, Profile};
 use crate::rt;
 use crate::settings::{self, Settings};
 
@@ -539,12 +539,13 @@ impl Workspace {
                         let user: Vec<usize> = (0..c.dbs[di].schemas.len())
                             .filter(|&si| !is_system(&c.dbs[di].schemas[si].name))
                             .collect();
-                        let (name, db) = (c.profile.name.clone(), c.profile.database.clone());
-                        this.status = format!("Connected to {name} · PostgreSQL {version}").into();
+                        let profile = c.profile.clone();
+                        this.status =
+                            format!("Connected to {} · {} {version}", profile.name, profile.engine.label()).into();
                         for si in user {
                             this.toggle(Node::Schema(ci, di, si), cx);
                         }
-                        this.ai.update(cx, |a, cx| a.set_target(&name, &db, cx));
+                        this.ai.update(cx, |a, cx| a.set_target(&profile, cx));
                     }
                     Err(e) => {
                         this.status = format!("Couldn't connect to {}", c.profile.name).into();
@@ -771,8 +772,7 @@ impl Workspace {
             .or_else(|| self.selected.and_then(|n| self.session_for(n)))
             .or_else(|| self.conns.iter().flat_map(|c| &c.dbs).find_map(|d| d.session.clone()));
         if let Some(s) = s {
-            let (n, d) = (s.profile.name.clone(), s.profile.database.clone());
-            self.ai.update(cx, |a, cx| a.set_target(&n, &d, cx));
+            self.ai.update(cx, |a, cx| a.set_target(&s.profile, cx));
         }
     }
 
@@ -1295,14 +1295,12 @@ impl Workspace {
             ShotStep::Query => {
                 if let Some(s) = self.conns.iter().flat_map(|c| &c.dbs).find_map(|d| d.session.clone()) {
                     self.query_count += 1;
-                    self.open_query(
-                        s,
-                        "Query 1".into(),
-                        "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM shop.orders o\nJOIN shop.order_items i ON i.order_id = o.id\nJOIN shop.products p ON p.id = i.product_id\nWHERE o.placed_at > now() - interval '30 days'\nGROUP BY o.status\nORDER BY revenue DESC;".into(),
-                        true,
-                        window,
-                        cx,
-                    );
+                    // The demo shop: scripts/seed.sql, or seed-sqlite.sql.
+                    let sql = match s.profile.engine {
+                        Engine::Postgres => "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM shop.orders o\nJOIN shop.order_items i ON i.order_id = o.id\nJOIN shop.products p ON p.id = i.product_id\nWHERE o.placed_at > now() - interval '30 days'\nGROUP BY o.status\nORDER BY revenue DESC;",
+                        Engine::Sqlite => "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM orders o\nJOIN order_items i ON i.order_id = o.id\nJOIN products p ON p.id = i.product_id\nWHERE o.placed_at > datetime('now', '-30 days')\nGROUP BY o.status\nORDER BY revenue DESC;",
+                    };
+                    self.open_query(s, "Query 1".into(), sql.into(), true, window, cx);
                 }
             }
             ShotStep::Map => {
@@ -1384,11 +1382,21 @@ impl Workspace {
                 LoadState::Failed(_) => (false, Some("failed".to_string())),
                 _ => (false, None),
             };
+            // A SQLite file is one database with one schema, so its tables
+            // hang straight off the connection.
+            let flat = c.profile.engine == Engine::Sqlite;
+            let lift = if flat { 2 } else { 0 };
+            let loading = loading
+                || (flat && c.dbs.iter().flat_map(|d| &d.schemas).any(|s| s.state == LoadState::Loading));
             rows.push(Row {
                 node: Node::Conn(ci),
                 depth: 0,
                 label: c.profile.name.clone(),
-                icon: if c.state == LoadState::Ready { "server" } else { "server-off" },
+                icon: match (flat, c.state == LoadState::Ready) {
+                    (true, _) => "database",
+                    (false, true) => "server",
+                    (false, false) => "server-off",
+                },
                 expandable: true,
                 expanded: c.expanded,
                 loading,
@@ -1399,32 +1407,36 @@ impl Workspace {
                 continue;
             }
             for (di, d) in c.dbs.iter().enumerate() {
-                rows.push(Row {
-                    node: Node::Db(ci, di),
-                    depth: 1,
-                    label: d.name.clone(),
-                    icon: "database",
-                    expandable: true,
-                    expanded: d.expanded,
-                    loading: d.state == LoadState::Loading,
-                    muted: d.session.is_none(),
-                    detail: None,
-                });
+                if !flat {
+                    rows.push(Row {
+                        node: Node::Db(ci, di),
+                        depth: 1,
+                        label: d.name.clone(),
+                        icon: "database",
+                        expandable: true,
+                        expanded: d.expanded,
+                        loading: d.state == LoadState::Loading,
+                        muted: d.session.is_none(),
+                        detail: None,
+                    });
+                }
                 if !d.expanded {
                     continue;
                 }
                 for (si, s) in d.schemas.iter().enumerate() {
-                    rows.push(Row {
-                        node: Node::Schema(ci, di, si),
-                        depth: 2,
-                        label: s.name.clone(),
-                        icon: if s.expanded { "folder-open" } else { "folder" },
-                        expandable: true,
-                        expanded: s.expanded,
-                        loading: s.state == LoadState::Loading,
-                        muted: is_system(&s.name),
-                        detail: None,
-                    });
+                    if !flat {
+                        rows.push(Row {
+                            node: Node::Schema(ci, di, si),
+                            depth: 2,
+                            label: s.name.clone(),
+                            icon: if s.expanded { "folder-open" } else { "folder" },
+                            expandable: true,
+                            expanded: s.expanded,
+                            loading: s.state == LoadState::Loading,
+                            muted: is_system(&s.name),
+                            detail: None,
+                        });
+                    }
                     if !s.expanded || s.state != LoadState::Ready {
                         continue;
                     }
@@ -1437,7 +1449,7 @@ impl Workspace {
                         let open = s.open_groups.contains(&kind);
                         rows.push(Row {
                             node: Node::Group(ci, di, si, kind),
-                            depth: 3,
+                            depth: 3 - lift,
                             label: kind.label().to_string(),
                             icon: kind_icon(kind),
                             expandable: true,
@@ -1452,7 +1464,7 @@ impl Workspace {
                         for (oi, o) in items {
                             rows.push(Row {
                                 node: Node::Object(ci, di, si, oi),
-                                depth: 4,
+                                depth: 4 - lift,
                                 label: match &o.signature {
                                     Some(sig) => format!("{}({sig})", o.name),
                                     None => o.name.clone(),
@@ -1511,6 +1523,8 @@ impl Workspace {
                             w.selected = Some(Node::Conn(ci));
                             w.new_query(window, cx)
                         })))
+                        // A SQLite file has no schema row to ask for its map.
+                        .item(act("Schema map", "orbit", Box::new(move |w, window, cx| w.open_map(Some(node), window, cx))))
                         .item(act("Disconnect", "unplug", Box::new(move |w, _, cx| w.disconnect(ci, cx))));
                 } else {
                     m = m.item(act("Connect", "plug", Box::new(move |w, _, cx| w.connect(ci, None, cx))));

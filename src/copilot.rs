@@ -274,6 +274,7 @@ mod tests {
         let req = AskRequest {
             agent: Agent::Copilot,
             connection: "shop db".into(),
+            engine: crate::profiles::Engine::Postgres,
             database: "postgres".into(),
             prompt: "hi".into(),
             history: vec![],

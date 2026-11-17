@@ -1,5 +1,5 @@
-//! The connection form: new or edit, with a URL paste box, SSL mode and
-//! what AI agents may do on this connection.
+//! The connection form: new or edit, for a PostgreSQL server or a SQLite
+//! file, with a URL paste box and what AI agents may do on this connection.
 
 use gpui_kit::component::{
     StyledExt as _,
@@ -12,13 +12,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _, Render,
-    Styled as _, Subscription, Window, div,
+    AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
+    PathPromptOptions, Render, Styled as _, Subscription, Window, div,
 };
 
 use super::icon;
 use crate::db::Session;
-use crate::profiles::{AiAccess, Profile, SslMode};
+use crate::profiles::{AiAccess, Engine, Profile, SslMode};
 use crate::rt;
 
 pub enum ConnectEvent {
@@ -28,8 +28,11 @@ pub enum ConnectEvent {
 
 pub struct ConnectForm {
     editing: Option<String>,
+    engine: Engine,
     url: Entity<InputState>,
     name: Entity<InputState>,
+    /// SQLite: the database file.
+    path: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
     user: Entity<InputState>,
@@ -55,8 +58,15 @@ impl ConnectForm {
             let (v, ph) = (v.to_string(), ph.to_string());
             cx.new(|cx| InputState::new(window, cx).placeholder(ph).default_value(v))
         };
-        let url = input("", "Paste a URL: postgres://user:password@host:5432/database", window, cx);
+        let url = input("", "Paste a URL (postgres://user:password@host/database) or a SQLite file's path", window, cx);
         let name = input(&p.name, "My database", window, cx);
+        // Each engine's fields start from its own profile, so switching the
+        // type while editing doesn't carry a file path into the server fields.
+        let (lite, p) = match p.engine {
+            Engine::Sqlite => (p.database.clone(), Profile { ssl: p.ssl, ai: p.ai, engine: p.engine, ..Profile::default() }),
+            Engine::Postgres => (String::new(), p),
+        };
+        let path = input(&lite, "/path/to/database.db", window, cx);
         let host = input(&p.host, "localhost", window, cx);
         let port = input(&p.port.to_string(), "5432", window, cx);
         let user = input(&p.user, "postgres", window, cx);
@@ -77,8 +87,10 @@ impl ConnectForm {
         });
         ConnectForm {
             editing: existing.map(|(p, _)| p.name),
+            engine: p.engine,
             url,
             name,
+            path,
             host,
             port,
             user,
@@ -99,6 +111,12 @@ impl ConnectForm {
         if self.name.read(cx).value().is_empty() {
             set(&self.name, p.name.clone(), window, cx);
         }
+        self.engine = p.engine;
+        if p.engine == Engine::Sqlite {
+            set(&self.path, p.database.clone(), window, cx);
+            cx.notify();
+            return;
+        }
         set(&self.host, p.host.clone(), window, cx);
         set(&self.port, p.port.to_string(), window, cx);
         set(&self.user, p.user.clone(), window, cx);
@@ -112,9 +130,21 @@ impl ConnectForm {
 
     fn profile(&self, cx: &gpui_kit::App) -> Result<(Profile, Option<String>), String> {
         let v = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
+        if self.engine == Engine::Sqlite {
+            let path = v(&self.path);
+            if path.is_empty() {
+                return Err("Choose the database file".to_string());
+            }
+            let p = Profile {
+                ai: self.ai,
+                ..Profile::sqlite(&v(&self.name), &path)
+            };
+            return Ok((p, None));
+        }
         let port = v(&self.port).parse::<u16>().map_err(|_| "Port must be a number".to_string())?;
         let mut p = Profile {
             name: v(&self.name),
+            engine: Engine::Postgres,
             host: v(&self.host),
             port,
             user: v(&self.user),
@@ -143,20 +173,40 @@ impl ConnectForm {
         };
         self.testing = true;
         self.test_result = None;
+        let engine = p.engine.label();
         let fut = rt::spawn(async move { Ok(Session::connect(p, pw).await?.server_version.clone()) });
         cx.spawn(async move |this, cx| {
             let out = fut.await;
             let _ = this.update(cx, |this, cx| {
                 this.testing = false;
                 this.test_result = Some(match out {
-                    Ok(v) => Ok(format!("Connected · PostgreSQL {v}")),
-                    Err(e) => Err(e.to_string()),
+                    Ok(v) => Ok(format!("Connected · {engine} {v}")),
+                    Err(e) => Err(format!("{e:#}")),
                 });
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// Pick the SQLite file with the system's file dialog.
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let p = Profile::sqlite("", &path.to_string_lossy());
+                this.fill(&p, None, window, cx);
+            });
+        })
+        .detach();
     }
 
     fn save(&mut self, connect: bool, cx: &mut Context<Self>) {
@@ -186,6 +236,18 @@ impl ConnectForm {
 impl Render for ConnectForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let engine_buttons = Engine::ALL.map(|e| {
+            Button::new(e.label())
+                .xsmall()
+                .label(e.label())
+                .when(self.engine == e, |b| b.primary())
+                .when(self.engine != e, |b| b.outline())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.engine = e;
+                    this.test_result = None;
+                    cx.notify();
+                }))
+        });
         let ssl_buttons = SslMode::ALL.map(|m| {
             Button::new(m.label())
                 .xsmall()
@@ -208,12 +270,18 @@ impl Render for ConnectForm {
                     cx.notify();
                 }))
         });
-        let ai_help = match self.ai {
-            AiAccess::Off => "Agents can't see this connection.",
-            AiAccess::ReadOnly => "Agents can read the schema and run queries in a read-only transaction.",
-            AiAccess::AskForWrites => "Read-only, and Tabula asks you before an agent's write runs.",
-            AiAccess::ReadWrite => "Agents can run any statement. Use only for throwaway databases.",
+        let ai_help = match (self.ai, self.engine) {
+            (AiAccess::Off, _) => "Agents can't see this connection.",
+            (AiAccess::ReadOnly, Engine::Postgres) => {
+                "Agents can read the schema and run queries in a read-only transaction."
+            }
+            (AiAccess::ReadOnly, Engine::Sqlite) => {
+                "Agents can read the schema and run queries on a read-only connection."
+            }
+            (AiAccess::AskForWrites, _) => "Read-only, and Tabula asks you before an agent's write runs.",
+            (AiAccess::ReadWrite, _) => "Agents can run any statement. Use only for throwaway databases.",
         };
+        let server = self.engine == Engine::Postgres;
         v_flex()
             .w(super::rem(560.))
             .p_5()
@@ -235,26 +303,50 @@ impl Render for ConnectForm {
                     })),
             )
             .child(Input::new(&self.url).small())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().w(super::rem(70.)).text_xs().font_medium().child("Type"))
+                    .children(engine_buttons),
+            )
             .child(Self::field("Name", &self.name))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Self::field("Host", &self.host)))
-                    .child(div().w(super::rem(90.)).child(Self::field("Port", &self.port))),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(Self::field("User", &self.user))
-                    .child(Self::field("Password", &self.password)),
-            )
-            .child(Self::field("Database", &self.database))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().w(super::rem(70.)).text_xs().font_medium().child("SSL"))
-                    .children(ssl_buttons),
-            )
+            .when(server, |form| {
+                form.child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Self::field("Host", &self.host)))
+                        .child(div().w(super::rem(90.)).child(Self::field("Port", &self.port))),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Self::field("User", &self.user))
+                        .child(Self::field("Password", &self.password)),
+                )
+                .child(Self::field("Database", &self.database))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().w(super::rem(70.)).text_xs().font_medium().child("SSL"))
+                        .children(ssl_buttons),
+                )
+            })
+            .when(!server, |form| {
+                form.child(
+                    h_flex()
+                        .gap_2()
+                        .items_end()
+                        .child(Self::field("Database file", &self.path))
+                        .child(
+                            Button::new("browse")
+                                .small()
+                                .outline()
+                                .icon(icon("folder-open"))
+                                .label("Browse…")
+                                .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx))),
+                        ),
+                )
+            })
             .child(
                 div()
                     .pl(super::rem(78.))

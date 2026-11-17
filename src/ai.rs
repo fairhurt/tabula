@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use crate::agents::{self, Agent};
+use crate::profiles::Engine;
 
 /// What the panel sees while a run streams.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,8 @@ pub struct AskRequest {
     pub agent: Agent,
     /// The Tabula connection the agent works on.
     pub connection: String,
+    pub engine: Engine,
+    /// The database's name as the user sees it (a SQLite file's name).
     pub database: String,
     pub prompt: String,
     /// Earlier turns, for agents that can't resume a session.
@@ -72,12 +75,14 @@ impl Run {
 
 pub(crate) fn system_prompt(req: &AskRequest) -> String {
     format!(
-        "You are the AI assistant inside Tabula, a PostgreSQL client. The user is working on the connection \"{conn}\" (database \"{db}\"). \
+        "You are the AI assistant inside Tabula, a database client. The user is working on the connection \"{conn}\" ({engine} database \"{db}\"). \
 Use the `tabula` MCP tools to look at the real schema and data before answering: list_tables, describe_table, sample_rows, run_query, explain_query. \
 Pass connection=\"{conn}\" to every tool. \
+Write SQL in {engine}'s dialect. \
 Put any SQL the user might run in a ```sql fenced block; Tabula shows an Insert button on those blocks. \
 Be concise. Don't modify data unless the user explicitly asks.",
         conn = req.connection,
+        engine = req.engine.label(),
         db = req.database
     )
 }
@@ -396,6 +401,7 @@ mod tests {
         AskRequest {
             agent,
             connection: "shop db".into(),
+            engine: Engine::Postgres,
             database: "postgres".into(),
             prompt: "how many orders?".into(),
             history: vec![("hi".into(), "hello".into())],
@@ -455,8 +461,20 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_names_the_dialect() {
+        let pg = system_prompt(&req(Agent::Claude));
+        assert!(pg.contains("(PostgreSQL database \"postgres\")") && pg.contains("PostgreSQL's dialect"), "{pg}");
+        let lite = system_prompt(&AskRequest {
+            engine: Engine::Sqlite,
+            database: "shop.db".into(),
+            ..req(Agent::Claude)
+        });
+        assert!(lite.contains("(SQLite database \"shop.db\")") && lite.contains("SQLite's dialect"), "{lite}");
+    }
+
+    #[test]
     fn finds_sql_blocks() {
-        let t = "Try:\n```sql\nselect 1;\n```\nor\n```\nnot sql\n```\n```sql\nselect 2\n```";
+        let t = "Try:\n```sql\nselect 1;\n```\nor\n```\nnot sql\n```\n```sqlite\nselect 2\n```";
         assert_eq!(sql_blocks(t), vec!["select 1;", "select 2"]);
     }
 }

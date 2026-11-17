@@ -3,9 +3,10 @@
 //! databases saved in Tabula.
 //!
 //! Agents see connection *names* only, never passwords. What they may do is
-//! set per connection ([`AiAccess`]): by default every statement runs in a
-//! read-only transaction with a timeout; "ask for writes" sends a write to
-//! the open Tabula window for you to approve.
+//! set per connection ([`AiAccess`]): by default every statement runs
+//! read-only (a read-only transaction on PostgreSQL, a read-only connection
+//! on SQLite) with a timeout; "ask for writes" sends a write to the open
+//! Tabula window for you to approve.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::db::{self, ObjectKind, QueryOutcome, Session};
 use crate::link::{self, LinkRequest};
-use crate::profiles::{self, AiAccess, Profile};
+use crate::profiles::{self, AiAccess, Engine, Profile};
 use crate::rt;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -26,7 +27,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CELL: usize = 1_000;
 
-const INSTRUCTIONS: &str = "Tabula gives you the user's PostgreSQL databases. Start with `list_connections`, then `list_tables` and `describe_table` to learn the schema before writing SQL. `run_query` runs one statement; most connections are read-only for agents. Use `open_in_tabula` to show the user a query's results in the Tabula app.";
+const INSTRUCTIONS: &str = "Tabula gives you the user's PostgreSQL and SQLite databases. Start with `list_connections`, which says which engine each connection is, then `list_tables` and `describe_table` to learn the schema before writing SQL in that engine's dialect. `run_query` runs one statement; most connections are read-only for agents. Use `open_in_tabula` to show the user a query's results in the Tabula app.";
 
 pub struct Server {
     /// Connection used when a tool call names none.
@@ -215,8 +216,13 @@ impl Server {
                     .map(|p| {
                         json!({
                             "connection": p.name,
+                            "engine": match p.engine {
+                                Engine::Postgres => "postgresql",
+                                Engine::Sqlite => "sqlite",
+                            },
+                            // For SQLite, the path of the file.
                             "database": p.database,
-                            "host": p.host,
+                            "host": (p.engine == Engine::Postgres).then_some(&p.host),
                             "access": match p.ai {
                                 AiAccess::ReadOnly => "read-only",
                                 AiAccess::AskForWrites => "read-only; writes need the user's approval in Tabula",
@@ -226,7 +232,7 @@ impl Server {
                         })
                     })
                     .collect();
-                Ok(serde_json::to_string_pretty(&list)?)
+                Ok(serde_json::to_string_pretty(&strip_nulls(Value::Array(list)))?)
             }
             "list_schemas" => {
                 let s = self.session(&self.profile(args)?)?;
@@ -276,27 +282,10 @@ impl Server {
                 Ok(format_outcome(&out))
             }
             "explain_query" => {
-                let p = self.profile(args)?;
-                let s = self.session(&p)?;
+                let s = self.session(&self.profile(args)?)?;
                 let sql = args["sql"].as_str().ok_or_else(|| anyhow!("`sql` is required"))?;
                 let analyze = args["analyze"].as_bool().unwrap_or(false);
-                let explain = format!(
-                    "EXPLAIN ({}FORMAT TEXT) {}",
-                    if analyze { "ANALYZE, BUFFERS, " } else { "" },
-                    sql.trim().trim_end_matches(';')
-                );
-                let out = rt::block_on(s.run_read_only(&explain, 2_000, QUERY_TIMEOUT))?;
-                let plan = out
-                    .main()
-                    .map(|r| {
-                        r.rows
-                            .iter()
-                            .filter_map(|row| row.first().cloned().flatten())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                Ok(plan)
+                rt::block_on(s.plan(sql, analyze, QUERY_TIMEOUT))
             }
             "sample_rows" => {
                 let p = self.profile(args)?;
@@ -486,13 +475,13 @@ fn tool_specs() -> Value {
     json!([
         {
             "name": "list_connections",
-            "description": "List the database connections the user has shared with agents, and what each allows (read-only or read-write).",
+            "description": "List the database connections the user has shared with agents: each one's engine (postgresql or sqlite), and what it allows (read-only or read-write).",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": true}
         },
         {
             "name": "list_schemas",
-            "description": "List the schemas in a database.",
+            "description": "List the schemas in a database. A SQLite database has one, `main`.",
             "inputSchema": {"type": "object", "properties": {"connection": conn}},
             "annotations": {"readOnlyHint": true}
         },
@@ -526,7 +515,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "run_query",
-            "description": "Run one SQL statement and return its rows as JSON. On read-only connections it runs in a read-only transaction; writes fail, or wait for the user's approval in Tabula when the connection asks for it. 30 s timeout.",
+            "description": "Run one SQL statement, in the connection's dialect, and return its rows as JSON. On read-only connections the database itself refuses writes; they fail, or wait for the user's approval in Tabula when the connection asks for it. 30 s timeout.",
             "inputSchema": {"type": "object", "properties": {
                 "connection": conn,
                 "sql": {"type": "string"},
@@ -535,7 +524,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "explain_query",
-            "description": "Show PostgreSQL's plan for a statement. With analyze=true it runs the statement (read-only) and reports actual timings and buffers.",
+            "description": "Show the database's plan for a statement: EXPLAIN on PostgreSQL, EXPLAIN QUERY PLAN on SQLite. With analyze=true PostgreSQL runs the statement (read-only) and reports actual timings and buffers; SQLite has no equivalent.",
             "inputSchema": {"type": "object", "properties": {
                 "connection": conn,
                 "sql": {"type": "string"},
@@ -659,6 +648,75 @@ mod tests {
         assert!(err && text.contains("approval"), "{text}");
         let (_, err) = tool(&s, "run_query", json!({"sql": "select 1"}));
         assert!(!err);
+    }
+
+    fn sqlite_server(access: AiAccess) -> (tempfile::TempDir, Server) {
+        let (dir, path) = db::sqlite::demo_database();
+        let p = Profile {
+            ai: access,
+            ..Profile::sqlite("shop", &path)
+        };
+        (dir, Server::with_profiles(vec![(p, None)]))
+    }
+
+    #[test]
+    fn agents_explore_and_query_sqlite_read_only() {
+        let (_dir, s) = sqlite_server(AiAccess::ReadOnly);
+        let (text, _) = tool(&s, "list_connections", json!({}));
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v[0]["engine"], "sqlite");
+        assert!(v[0]["database"].as_str().unwrap().ends_with("shop.db"), "{text}");
+        assert!(v[0].get("host").is_none(), "{text}");
+
+        let (text, err) = tool(&s, "list_schemas", json!({}));
+        assert!(!err && text == r#"["main"]"#, "{text}");
+        let (text, err) = tool(&s, "list_tables", json!({}));
+        assert!(!err && text.contains("main.orders") && text.contains("\"view\""), "{text}");
+        assert!(text.contains("100000"), "row counts from ANALYZE: {text}");
+        for table in ["orders", "main.orders"] {
+            let (text, err) = tool(&s, "describe_table", json!({"table": table}));
+            assert!(!err && text.contains("orders_customer_idx") && text.contains("FOREIGN KEY"), "{text}");
+        }
+
+        let (text, err) = tool(&s, "run_query", json!({"sql": "select status, count(*) as n from orders group by 1 order by 1"}));
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["columns"], json!(["status (TEXT)", "n"]));
+        assert_eq!(v["rows"].as_array().unwrap().len(), 4);
+        assert_eq!(v["rows"][0], json!(["cancelled", "25000"]));
+
+        let (text, err) = tool(&s, "run_query", json!({"sql": "delete from order_items"}));
+        assert!(err && text.contains("read-only for agents"), "{text}");
+        let (text, err) = tool(&s, "run_query", json!({"sql": "select 1; delete from order_items"}));
+        assert!(err && text.contains("one statement"), "{text}");
+
+        let (text, err) = tool(&s, "run_query", json!({"sql": "select id from orders", "max_rows": 5}));
+        assert!(!err && text.contains("truncated"), "{text}");
+
+        let (text, err) = tool(&s, "explain_query", json!({"sql": "select * from orders where customer_id = 7;"}));
+        assert!(!err && text.contains("orders_customer_idx"), "{text}");
+
+        let (text, err) = tool(&s, "sample_rows", json!({"table": "customers", "limit": 3}));
+        assert!(!err && text.contains("user1@example.com"), "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sqlite_writes_follow_the_connection() {
+        let (_dir, s) = sqlite_server(AiAccess::AskForWrites);
+        let update = json!({"sql": "update orders set note = 'x' where id = 1"});
+        let (text, err) = tool(&s, "run_query", update.clone());
+        assert!(err && text.contains("approval"), "{text}");
+        let (_, err) = tool(&s, "run_query", json!({"sql": "select 1"}));
+        assert!(!err);
+
+        let (_dir, s) = sqlite_server(AiAccess::ReadWrite);
+        let (text, err) = tool(&s, "run_query", update);
+        assert!(!err, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["rows_affected"], 1);
+        let (text, _) = tool(&s, "run_query", json!({"sql": "select note from orders where id = 1"}));
+        assert!(text.contains("\"x\""), "{text}");
     }
 
     /// A write on an "ask" connection goes to the app over the live link and

@@ -1,8 +1,9 @@
-//! Tabula: a PostgreSQL viewer and query tool built with GPUI Kit, that AI
-//! agents can use too.
+//! Tabula: a PostgreSQL and SQLite viewer and query tool built with GPUI
+//! Kit, that AI agents can use too.
 //!
 //!   tabula                                  open the app
 //!   tabula --url postgres://…               open the app and connect
+//!   tabula --url sqlite:/path/to/file.db    (or just the file's path)
 //!   tabula --connect NAME                   open the app on a saved connection
 //!   tabula mcp [--connection NAME]          MCP server on stdio, for agents
 //!   tabula add NAME URL [--ai MODE]         save a connection (MODE: off,
@@ -101,7 +102,7 @@ fn main() -> anyhow::Result<()> {
         Some("mcp") => mcp::Server::new(flag("--connection")).serve_stdio(),
         Some("add") => {
             let (Some(name), Some(url)) = (args.get(1), args.get(2)) else {
-                bail!("usage: tabula add NAME postgres://user:pass@host/db [--ai off|read-only|ask|read-write]");
+                bail!("usage: tabula add NAME postgres://user:pass@host/db [--ai off|read-only|ask|read-write]\n       tabula add NAME sqlite:/path/to/file.db [--ai …]");
             };
             let (mut p, pw) = Profile::from_url(name, url)?;
             p.ai = match flag("--ai").as_deref() {
@@ -156,7 +157,8 @@ fn main() -> anyhow::Result<()> {
             let (mut rx, _run) = ai::ask(ai::AskRequest {
                 agent,
                 connection: p.name.clone(),
-                database: p.database.clone(),
+                engine: p.engine,
+                database: p.database_label(),
                 prompt: prompt.clone(),
                 history: vec![],
                 resume: None,
