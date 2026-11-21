@@ -7,6 +7,8 @@
 pub struct Catalog {
     pub schemas: Vec<String>,
     pub tables: Vec<Table>,
+    /// Whose rules names are quoted by.
+    pub engine: crate::profiles::Engine,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,11 +67,14 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// `name`, quoted when PostgreSQL would otherwise fold or reject it.
-fn ident(name: &str) -> String {
-    let plain = name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if plain { name.to_string() } else { crate::db::quote_ident(name) }
+/// `name`, quoted when the engine would otherwise fold or reject it.
+/// PostgreSQL folds unquoted names to lower case; the others keep case.
+fn ident(engine: crate::profiles::Engine, name: &str) -> String {
+    use crate::profiles::Engine;
+    let folds = matches!(engine, Engine::Postgres | Engine::Sqlite);
+    let ok = |c: char| c.is_ascii_lowercase() || c == '_' || (!folds && c.is_ascii_uppercase());
+    let plain = name.chars().next().is_some_and(ok) && name.chars().all(|c| ok(c) || c.is_ascii_digit());
+    if plain { name.to_string() } else { engine.quote_ident(name) }
 }
 
 /// A table named in a statement, and what it is called there.
@@ -168,7 +173,7 @@ impl Catalog {
     fn columns_of(&self, t: &Table, out: &mut Vec<Suggestion>) {
         out.extend(t.columns.iter().map(|(name, ty)| Suggestion {
             label: name.clone(),
-            insert: ident(name),
+            insert: ident(self.engine, name),
             detail: format!("{ty} · {}", t.name),
             kind: Kind::Column,
         }));
@@ -181,10 +186,12 @@ impl Catalog {
             }
             out.push(Suggestion {
                 label: t.name.clone(),
-                insert: if qualify && t.schema != "public" {
-                    format!("{}.{}", ident(&t.schema), ident(&t.name))
+                insert: if qualify && t.schema != "public" && t.schema != self.engine.default_schema()
+                    && self.engine != crate::profiles::Engine::MySql
+                {
+                    format!("{}.{}", ident(self.engine, &t.schema), ident(self.engine, &t.name))
                 } else {
-                    ident(&t.name)
+                    ident(self.engine, &t.name)
                 },
                 detail: format!("{} · {}", t.schema, if t.view { "view" } else { "table" }),
                 kind: if t.view { Kind::View } else { Kind::Table },
@@ -195,7 +202,7 @@ impl Catalog {
     fn schemas(&self, out: &mut Vec<Suggestion>) {
         out.extend(self.schemas.iter().map(|s| Suggestion {
             label: s.clone(),
-            insert: ident(s),
+            insert: ident(self.engine, s),
             detail: "schema".into(),
             kind: Kind::Schema,
         }));
@@ -321,6 +328,7 @@ mod tests {
                 table("orders", false, &[("id", "bigint"), ("customer_id", "integer"), ("status", "shop.order_status")]),
                 table("order_totals", true, &[("order_id", "bigint"), ("total", "numeric")]),
             ],
+            engine: crate::profiles::Engine::Postgres,
         }
     }
 
@@ -393,8 +401,13 @@ mod tests {
 
     #[test]
     fn names_that_need_quotes_get_them() {
-        assert_eq!(ident("orders"), "orders");
-        assert_eq!(ident("Order Items"), "\"Order Items\"");
-        assert_eq!(ident("2fa"), "\"2fa\"");
+        use crate::profiles::Engine;
+        assert_eq!(ident(Engine::Postgres, "orders"), "orders");
+        assert_eq!(ident(Engine::Postgres, "Order Items"), "\"Order Items\"");
+        assert_eq!(ident(Engine::Postgres, "2fa"), "\"2fa\"");
+        assert_eq!(ident(Engine::Postgres, "Orders"), "\"Orders\"");
+        assert_eq!(ident(Engine::MySql, "Orders"), "Orders");
+        assert_eq!(ident(Engine::MySql, "Order Items"), "`Order Items`");
+        assert_eq!(ident(Engine::SqlServer, "Order Items"), "[Order Items]");
     }
 }

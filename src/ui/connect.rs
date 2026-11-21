@@ -1,5 +1,6 @@
-//! The connection form: new or edit, for a PostgreSQL server or a SQLite
-//! file, with a URL paste box and what AI agents may do on this connection.
+//! The connection form: new or edit, for a PostgreSQL, MySQL or SQL Server
+//! server or a SQLite file, with a URL paste box and what AI agents may do on
+//! this connection.
 
 use gpui_kit::component::{
     StyledExt as _,
@@ -58,13 +59,18 @@ impl ConnectForm {
             let (v, ph) = (v.to_string(), ph.to_string());
             cx.new(|cx| InputState::new(window, cx).placeholder(ph).default_value(v))
         };
-        let url = input("", "Paste a URL (postgres://user:password@host/database) or a SQLite file's path", window, cx);
+        let url = input(
+            "",
+            "Paste a URL (postgres://, mysql://, sqlserver://) or a SQLite file's path",
+            window,
+            cx,
+        );
         let name = input(&p.name, "My database", window, cx);
         // Each engine's fields start from its own profile, so switching the
         // type while editing doesn't carry a file path into the server fields.
         let (lite, p) = match p.engine {
             Engine::Sqlite => (p.database.clone(), Profile { ssl: p.ssl, ai: p.ai, engine: p.engine, ..Profile::default() }),
-            Engine::Postgres => (String::new(), p),
+            _ => (String::new(), p),
         };
         let path = input(&lite, "/path/to/database.db", window, cx);
         let host = input(&p.host, "localhost", window, cx);
@@ -76,7 +82,7 @@ impl ConnectForm {
                 .placeholder("Password")
                 .default_value(pw.clone().unwrap_or_default())
         });
-        let database = input(&p.database, "postgres", window, cx);
+        let database = input(&p.database, "Leave empty for the login's default", window, cx);
         let sub = cx.subscribe_in(&url, window, |this, state, e: &InputEvent, window, cx| {
             if matches!(e, InputEvent::Change) {
                 let v = state.read(cx).value().to_string();
@@ -111,7 +117,7 @@ impl ConnectForm {
         if self.name.read(cx).value().is_empty() {
             set(&self.name, p.name.clone(), window, cx);
         }
-        self.engine = p.engine;
+        self.set_engine(p.engine, window, cx);
         if p.engine == Engine::Sqlite {
             set(&self.path, p.database.clone(), window, cx);
             cx.notify();
@@ -126,6 +132,35 @@ impl ConnectForm {
         }
         self.ssl = p.ssl;
         cx.notify();
+    }
+
+    /// Switch the form to `engine`. A port or user still at the old engine's
+    /// usual value moves to the new one's, so switching type and typing a
+    /// host is all a local server needs.
+    fn set_engine(&mut self, engine: Engine, window: &mut Window, cx: &mut Context<Self>) {
+        let old = self.engine;
+        self.engine = engine;
+        if old == engine || !engine.is_server() {
+            return;
+        }
+        let fields = [
+            (&self.port, old.default_port().to_string(), engine.default_port().to_string()),
+            (&self.user, old.default_user().to_string(), engine.default_user().to_string()),
+        ];
+        for (field, was, now) in fields {
+            let current = field.read(cx).value().trim().to_string();
+            if current.is_empty() || current == was {
+                field.update(cx, |s, cx| s.set_value(now, window, cx));
+            }
+        }
+        // PostgreSQL always connects to a database; the others can start in
+        // the login's default one.
+        let db = self.database.read(cx).value().trim().to_string();
+        if engine != Engine::Postgres && db == "postgres" {
+            self.database.update(cx, |s, cx| s.set_value("", window, cx));
+        } else if engine == Engine::Postgres && db.is_empty() {
+            self.database.update(cx, |s, cx| s.set_value("postgres", window, cx));
+        }
     }
 
     fn profile(&self, cx: &gpui_kit::App) -> Result<(Profile, Option<String>), String> {
@@ -144,7 +179,7 @@ impl ConnectForm {
         let port = v(&self.port).parse::<u16>().map_err(|_| "Port must be a number".to_string())?;
         let mut p = Profile {
             name: v(&self.name),
-            engine: Engine::Postgres,
+            engine: self.engine,
             host: v(&self.host),
             port,
             user: v(&self.user),
@@ -155,8 +190,11 @@ impl ConnectForm {
         if p.host.is_empty() {
             p.host = "localhost".into();
         }
+        if p.engine == Engine::Postgres && p.database.is_empty() {
+            return Err("Enter the database to connect to".to_string());
+        }
         if p.name.is_empty() {
-            p.name = format!("{}@{}", p.database, p.host);
+            p.name = p.default_name();
         }
         let pw = self.password.read(cx).value().to_string();
         Ok((p, (!pw.is_empty()).then_some(pw)))
@@ -242,8 +280,8 @@ impl Render for ConnectForm {
                 .label(e.label())
                 .when(self.engine == e, |b| b.primary())
                 .when(self.engine != e, |b| b.outline())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.engine = e;
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_engine(e, window, cx);
                     this.test_result = None;
                     cx.notify();
                 }))
@@ -272,8 +310,11 @@ impl Render for ConnectForm {
         });
         let ai_help = match (self.ai, self.engine) {
             (AiAccess::Off, _) => "Agents can't see this connection.",
-            (AiAccess::ReadOnly, Engine::Postgres) => {
+            (AiAccess::ReadOnly, Engine::Postgres | Engine::MySql) => {
                 "Agents can read the schema and run queries in a read-only transaction."
+            }
+            (AiAccess::ReadOnly, Engine::SqlServer) => {
+                "Agents can read the schema and run SELECTs, which Tabula checks and always rolls back. For a guarantee, use a login that can only read."
             }
             (AiAccess::ReadOnly, Engine::Sqlite) => {
                 "Agents can read the schema and run queries on a read-only connection."
@@ -281,7 +322,7 @@ impl Render for ConnectForm {
             (AiAccess::AskForWrites, _) => "Read-only, and Tabula asks you before an agent's write runs.",
             (AiAccess::ReadWrite, _) => "Agents can run any statement. Use only for throwaway databases.",
         };
-        let server = self.engine == Engine::Postgres;
+        let server = self.engine.is_server();
         v_flex()
             .w(super::rem(560.))
             .p_5()

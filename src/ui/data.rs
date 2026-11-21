@@ -74,6 +74,8 @@ impl DataTab {
     ) -> Self {
         let example = match session.profile.engine {
             Engine::Postgres => "e.g. status = 'paid' AND placed_at > now() - interval '1 day'",
+            Engine::MySql => "e.g. status = 'paid' AND placed_at > now() - interval 1 day",
+            Engine::SqlServer => "e.g. status = 'paid' AND placed_at > DATEADD(day, -1, SYSDATETIME())",
             Engine::Sqlite => "e.g. status = 'paid' AND placed_at > datetime('now', '-1 day')",
         };
         let filter = cx.new(|cx| {

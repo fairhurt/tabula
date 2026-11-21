@@ -218,11 +218,13 @@ impl Server {
                             "connection": p.name,
                             "engine": match p.engine {
                                 Engine::Postgres => "postgresql",
+                                Engine::MySql => "mysql",
+                                Engine::SqlServer => "sqlserver",
                                 Engine::Sqlite => "sqlite",
                             },
                             // For SQLite, the path of the file.
                             "database": p.database,
-                            "host": (p.engine == Engine::Postgres).then_some(&p.host),
+                            "host": p.engine.is_server().then_some(&p.host),
                             "access": match p.ai {
                                 AiAccess::ReadOnly => "read-only",
                                 AiAccess::AskForWrites => "read-only; writes need the user's approval in Tabula",
@@ -295,11 +297,12 @@ impl Server {
                     .ok_or_else(|| anyhow!("`table` is required"))?;
                 let (schema, name) = self.resolve_table(&s, table)?;
                 let n = args["limit"].as_u64().unwrap_or(10).clamp(1, 200);
-                let sql = format!(
-                    "SELECT * FROM {}.{} LIMIT {n}",
-                    db::quote_ident(&schema),
-                    db::quote_ident(&name)
-                );
+                let engine = s.profile.engine;
+                let table = format!("{}.{}", engine.quote_ident(&schema), engine.quote_ident(&name));
+                let sql = match engine {
+                    Engine::SqlServer => format!("SELECT TOP ({n}) * FROM {table}"),
+                    _ => format!("SELECT * FROM {table} LIMIT {n}"),
+                };
                 let out = rt::block_on(s.run_read_only(&sql, n as usize, QUERY_TIMEOUT))?;
                 Ok(format_outcome(&out))
             }
@@ -373,14 +376,22 @@ impl Server {
 
     /// `schema.table`, or a bare name looked up across schemas.
     fn resolve_table(&self, s: &Session, table: &str) -> anyhow::Result<(String, String)> {
-        let unquote = |x: &str| x.trim().trim_matches('"').replace("\"\"", "\"");
+        // "name", `name` or [name], however the agent quoted it.
+        let unquote = |x: &str| {
+            let x = x.trim();
+            match x.chars().next() {
+                Some('`') => x.trim_matches('`').replace("``", "`"),
+                Some('[') => x.trim_start_matches('[').trim_end_matches(']').replace("]]", "]"),
+                _ => x.trim_matches('"').replace("\"\"", "\""),
+            }
+        };
         if let Some((sc, n)) = table.split_once('.') {
             return Ok((unquote(sc), unquote(n)));
         }
         let name = unquote(table);
         let schemas = rt::block_on(s.schemas())?;
         let mut found = Vec::new();
-        for sc in schemas.iter().filter(|n| *n != "pg_catalog" && *n != "information_schema") {
+        for sc in schemas.iter().filter(|n| !db::is_system_schema(n)) {
             if rt::block_on(s.objects(sc))?
                 .iter()
                 .any(|o| o.name == name && o.kind != ObjectKind::Function)

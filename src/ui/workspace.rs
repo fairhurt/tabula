@@ -517,14 +517,17 @@ impl Workspace {
                 match out {
                     Ok((s, mut dbs, schemas)) => {
                         c.state = LoadState::Ready;
-                        if !dbs.contains(&c.profile.database) {
-                            dbs.insert(0, c.profile.database.clone());
+                        // MySQL and SQL Server pick a database when the
+                        // profile names none; the session says which.
+                        let current_db = s.profile.database.clone();
+                        if !dbs.contains(&current_db) {
+                            dbs.insert(0, current_db.clone());
                         }
                         let version = s.server_version.clone();
                         c.dbs = dbs
                             .into_iter()
                             .map(|name| {
-                                let current = name == c.profile.database;
+                                let current = name == current_db;
                                 DbNode {
                                     session: current.then(|| s.clone()),
                                     state: if current { LoadState::Ready } else { LoadState::Idle },
@@ -590,13 +593,20 @@ impl Workspace {
                 let Some(d) = this.conns.get_mut(ci).and_then(|c| c.dbs.get_mut(di)) else {
                     return;
                 };
+                let mut open_schema = false;
                 match out {
                     Ok((s, schemas)) => {
+                        // A MySQL database is its schema, so there's no
+                        // schema row to click: open it with the database.
+                        open_schema = s.profile.engine == Engine::MySql && !schemas.is_empty();
                         d.session = Some(s);
                         d.schemas = schema_nodes(&schemas);
                         d.state = LoadState::Ready;
                     }
                     Err(e) => d.state = LoadState::Failed(e.to_string()),
+                }
+                if open_schema {
+                    this.toggle(Node::Schema(ci, di, 0), cx);
                 }
                 cx.notify();
             });
@@ -1299,6 +1309,8 @@ impl Workspace {
                     let sql = match s.profile.engine {
                         Engine::Postgres => "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM shop.orders o\nJOIN shop.order_items i ON i.order_id = o.id\nJOIN shop.products p ON p.id = i.product_id\nWHERE o.placed_at > now() - interval '30 days'\nGROUP BY o.status\nORDER BY revenue DESC;",
                         Engine::Sqlite => "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM orders o\nJOIN order_items i ON i.order_id = o.id\nJOIN products p ON p.id = i.product_id\nWHERE o.placed_at > datetime('now', '-30 days')\nGROUP BY o.status\nORDER BY revenue DESC;",
+                        Engine::MySql => "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM orders o\nJOIN order_items i ON i.order_id = o.id\nJOIN products p ON p.id = i.product_id\nWHERE o.placed_at > now() - INTERVAL 30 DAY\nGROUP BY o.status\nORDER BY revenue DESC;",
+                        Engine::SqlServer => "-- Revenue by status, last 30 days\nSELECT o.status, count(*) AS orders, sum(p.price * i.quantity) AS revenue\nFROM shop.orders o\nJOIN shop.order_items i ON i.order_id = o.id\nJOIN shop.products p ON p.id = i.product_id\nWHERE o.placed_at > DATEADD(day, -30, SYSDATETIME())\nGROUP BY o.status\nORDER BY revenue DESC;",
                     };
                     self.open_query(s, "Query 1".into(), sql.into(), true, window, cx);
                 }
@@ -1383,9 +1395,11 @@ impl Workspace {
                 _ => (false, None),
             };
             // A SQLite file is one database with one schema, so its tables
-            // hang straight off the connection.
+            // hang straight off the connection. A MySQL database is its own
+            // schema, so its tables hang straight off the database.
             let flat = c.profile.engine == Engine::Sqlite;
-            let lift = if flat { 2 } else { 0 };
+            let schemaless = c.profile.engine == Engine::MySql;
+            let lift = if flat { 2 } else if schemaless { 1 } else { 0 };
             let loading = loading
                 || (flat && c.dbs.iter().flat_map(|d| &d.schemas).any(|s| s.state == LoadState::Loading));
             rows.push(Row {
@@ -1424,7 +1438,7 @@ impl Workspace {
                     continue;
                 }
                 for (si, s) in d.schemas.iter().enumerate() {
-                    if !flat {
+                    if !flat && !schemaless {
                         rows.push(Row {
                             node: Node::Schema(ci, di, si),
                             depth: 2,
@@ -2187,7 +2201,7 @@ fn schema_nodes(names: &[String]) -> Vec<SchemaNode> {
 }
 
 fn is_system(schema: &str) -> bool {
-    schema == "pg_catalog" || schema == "information_schema"
+    crate::db::is_system_schema(schema)
 }
 
 fn short_count(n: i64) -> String {

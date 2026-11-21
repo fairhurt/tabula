@@ -1,11 +1,15 @@
 //! Database access: connecting, the catalog, and running SQL.
 //!
-//! [`Session`] is what the rest of Tabula talks to. Behind it is one of two
-//! backends, [`postgres`] or [`sqlite`], picked by the profile's engine.
+//! [`Session`] is what the rest of Tabula talks to. Behind it is one of four
+//! backends, [`postgres`], [`mysql`], [`mssql`] or [`sqlite`], picked by the
+//! profile's engine.
 //! Everything here is async on tokio (see [`crate::rt`]), and every value
 //! comes back as text, so any type displays without per-type decoding.
 
+mod mssql;
+mod mysql;
 mod postgres;
+mod script;
 pub(crate) mod sqlite;
 
 use std::collections::HashMap;
@@ -129,11 +133,15 @@ pub struct DbObject {
     /// For functions: the argument list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Whose syntax the name is quoted in.
+    #[serde(skip)]
+    pub engine: Engine,
 }
 
 impl DbObject {
+    /// `schema.name`, each quoted the engine's way.
     pub fn qualified(&self) -> String {
-        format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name))
+        format!("{}.{}", self.engine.quote_ident(&self.schema), self.engine.quote_ident(&self.name))
     }
 }
 
@@ -212,15 +220,52 @@ pub struct ForeignKey {
     pub to_cols: Vec<String>,
 }
 
-/// `"name"`, doubling any quotes inside.
+/// `"name"`, doubling any quotes inside: PostgreSQL's and SQLite's quoting.
+/// See [`Engine::quote_ident`] for the others.
 pub fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+    Engine::Postgres.quote_ident(s)
 }
 
 
 /// `'text'`, doubling any quotes inside.
 pub fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A column type that holds bytes, which Tabula shows as `0x…` hex.
+pub(crate) fn is_binary_type(declared: &str) -> bool {
+    let t = declared.to_ascii_lowercase();
+    t.contains("binary") || t.contains("blob") || t == "image"
+}
+
+/// Bytes as `0x…` hex, cut short after `max` bytes with the full length noted.
+pub(crate) fn hex(bytes: &[u8], max: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(2 + 2 * bytes.len().min(max) + 16);
+    s.push_str("0x");
+    for b in &bytes[..bytes.len().min(max)] {
+        let _ = write!(s, "{b:02X}");
+    }
+    if bytes.len() > max {
+        let _ = write!(s, "… ({} bytes)", bytes.len());
+    }
+    s
+}
+
+/// The bytes a `0x…` value in a binary column stands for. A value the grid
+/// showed cut short can't be read back, and saving it would lose data.
+pub(crate) fn parse_hex(value: &str) -> anyhow::Result<Vec<u8>> {
+    if value.contains('…') {
+        anyhow::bail!("this value was cut short for display, so it can't be saved as it is");
+    }
+    let digits = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    if !digits.len().is_multiple_of(2) || !digits.bytes().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("binary values are written as hex, like 0x00FF");
+    }
+    (0..digits.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).map_err(anyhow::Error::from))
+        .collect()
 }
 
 /// A column name and its value as text (`None` is NULL).
@@ -272,11 +317,16 @@ impl EditTarget {
     }
 
     /// The value written by `value` (a literal or a placeholder), as the
-    /// column's type. PostgreSQL needs the cast, `value::type`; in SQLite
-    /// the column's affinity converts what it is given.
+    /// column's type. PostgreSQL needs the cast, `value::type`; SQL Server
+    /// converts text to anything but bytes on its own; in MySQL and SQLite
+    /// the column converts what it is given.
     fn typed(&self, column: &str, value: String) -> String {
         match (self.engine, self.types.get(column)) {
             (Engine::Postgres, Some(t)) => format!("{value}::{t}"),
+            // Style 1 reads the `0x…` text the grid shows.
+            (Engine::SqlServer, Some(t)) if is_binary_type(t) && value.starts_with('@') => {
+                format!("CONVERT(varbinary(max), {value}, 1)")
+            }
             _ => value,
         }
     }
@@ -288,11 +338,11 @@ impl EditTarget {
             cells
                 .iter()
                 .map(|(c, v)| {
-                    let rhs = self.typed(c, value(c, v));
+                    let name = self.engine.quote_ident(c);
                     if null_safe && v.is_none() {
-                        format!("{} IS NULL", quote_ident(c))
+                        format!("{name} IS NULL")
                     } else {
-                        format!("{} = {rhs}", quote_ident(c))
+                        format!("{name} = {}", self.typed(c, value(c, v)))
                     }
                 })
                 .collect::<Vec<_>>()
@@ -306,11 +356,15 @@ impl EditTarget {
             Change::Delete { key } => {
                 format!("DELETE FROM {} WHERE {}", self.qualified, assign(key, " AND ", true))
             }
+            // MySQL has no DEFAULT VALUES, but an empty list means the same.
+            Change::Insert { values } if values.is_empty() && self.engine == Engine::MySql => {
+                format!("INSERT INTO {} () VALUES ()", self.qualified)
+            }
             Change::Insert { values } if values.is_empty() => {
                 format!("INSERT INTO {} DEFAULT VALUES", self.qualified)
             }
             Change::Insert { values } => {
-                let cols: Vec<String> = values.iter().map(|(c, _)| quote_ident(c)).collect();
+                let cols: Vec<String> = values.iter().map(|(c, _)| self.engine.quote_ident(c)).collect();
                 let vals: Vec<String> = values.iter().map(|(c, v)| self.typed(c, value(c, v))).collect();
                 format!("INSERT INTO {} ({}) VALUES ({})", self.qualified, cols.join(", "), vals.join(", "))
             }
@@ -320,8 +374,20 @@ impl EditTarget {
     /// A value as a literal in the engine's own syntax.
     fn literal(&self, column: &str, value: &Option<String>) -> String {
         let quoted = || value.as_deref().map_or("NULL".to_string(), quote_literal);
+        let binary = self.declared(column).is_some_and(is_binary_type);
         match self.engine {
             Engine::Postgres => quoted(),
+            // Hex is already a literal in both; a value cut short for the
+            // grid stays quoted text, and saving refuses it.
+            Engine::MySql | Engine::SqlServer if binary && value.as_deref().is_some_and(|v| parse_hex(v).is_ok()) => {
+                value.clone().unwrap_or_default()
+            }
+            // MySQL reads a backslash in a string as an escape.
+            Engine::MySql => value
+                .as_deref()
+                .map_or("NULL".to_string(), |v| quote_literal(&v.replace('\\', "\\\\"))),
+            // N'…' keeps characters outside the database's code page.
+            Engine::SqlServer => value.as_deref().map_or("NULL".to_string(), |v| format!("N{}", quote_literal(v))),
             Engine::Sqlite => {
                 let declared = self.declared(column);
                 // A blob shown cut short can't be read back; saving refuses
@@ -337,7 +403,8 @@ impl EditTarget {
         format!("{sql};")
     }
 
-    /// `change` with placeholders (`$n` for PostgreSQL, `?n` for SQLite), and
+    /// `change` with placeholders (`$n` for PostgreSQL, `?` for MySQL, `@Pn`
+    /// for SQL Server, `?n` for SQLite), and
     /// the cells to bind to them. A NULL in a key becomes `IS NULL` and binds
     /// nothing.
     pub(crate) fn bound(&self, change: &Change) -> (String, Vec<Cell>) {
@@ -350,6 +417,8 @@ impl EditTarget {
             params.push((column.to_string(), v.clone()));
             match self.engine {
                 Engine::Postgres => format!("${}::text", params.len()),
+                Engine::MySql => "?".to_string(),
+                Engine::SqlServer => format!("@P{}", params.len()),
                 Engine::Sqlite => format!("?{}", params.len()),
             }
         });
@@ -362,7 +431,8 @@ impl EditTarget {
 }
 
 /// The error for a write that a read-only session turned down: PostgreSQL's
-/// read-only transaction (SQLSTATE 25006) or SQLite's read-only connection.
+/// or MySQL's read-only transaction, SQLite's read-only connection, or a
+/// statement Tabula's own check found writing (SQL Server).
 #[derive(Debug)]
 pub struct WriteRefused(pub String);
 
@@ -380,14 +450,18 @@ pub fn needs_write_access(e: &anyhow::Error) -> bool {
 }
 
 enum Backend {
-    // Boxed: two clients make it several times the size of the other.
+    // Boxed: their clients make them many times the size of the others.
     Postgres(Box<postgres::Backend>),
+    MySql(mysql::Backend),
+    SqlServer(Box<mssql::Backend>),
     Sqlite(sqlite::Backend),
 }
 
 /// Stops the query running on a session's work connection.
 pub enum Canceller {
     Postgres(tokio_postgres::CancelToken),
+    MySql(mysql::Stop),
+    SqlServer(mssql::Stop),
     Sqlite(sqlite::Stop),
 }
 
@@ -395,6 +469,8 @@ impl Canceller {
     pub async fn cancel(self) -> anyhow::Result<()> {
         match self {
             Canceller::Postgres(token) => token.cancel_query(tokio_postgres::NoTls).await?,
+            Canceller::MySql(stop) => stop.stop().await?,
+            Canceller::SqlServer(stop) => stop.stop(),
             Canceller::Sqlite(stop) => stop.stop(),
         }
         Ok(())
@@ -417,17 +493,30 @@ macro_rules! backend {
     ($session:expr, $b:ident => $call:expr) => {
         match &$session.backend {
             Backend::Postgres($b) => $call,
+            Backend::MySql($b) => $call,
+            Backend::SqlServer($b) => $call,
             Backend::Sqlite($b) => $call,
         }
     };
 }
 
 impl Session {
-    pub async fn connect(profile: Profile, password: Option<String>) -> anyhow::Result<Arc<Session>> {
+    /// Connect. A MySQL or SQL Server profile that names no database gets the
+    /// one the server picks for the login, and the session's profile says
+    /// which.
+    pub async fn connect(mut profile: Profile, password: Option<String>) -> anyhow::Result<Arc<Session>> {
         let (backend, server_version) = match profile.engine {
             Engine::Postgres => {
                 let (b, v) = postgres::Backend::connect(&profile, password.as_deref()).await?;
                 (Backend::Postgres(Box::new(b)), v)
+            }
+            Engine::MySql => {
+                let (b, v) = mysql::Backend::connect(&mut profile, password.as_deref()).await?;
+                (Backend::MySql(b), v)
+            }
+            Engine::SqlServer => {
+                let (b, v) = mssql::Backend::connect(&mut profile, password.as_deref()).await?;
+                (Backend::SqlServer(Box::new(b)), v)
             }
             Engine::Sqlite => {
                 let (b, v) = sqlite::Backend::connect(&profile.database).await?;
@@ -451,6 +540,8 @@ impl Session {
     pub fn canceller(&self) -> Canceller {
         match &self.backend {
             Backend::Postgres(b) => Canceller::Postgres(b.cancel_token()),
+            Backend::MySql(b) => Canceller::MySql(b.stop_handle()),
+            Backend::SqlServer(b) => Canceller::SqlServer(b.stop_handle()),
             Backend::Sqlite(b) => Canceller::Sqlite(b.stop_handle()),
         }
     }
@@ -459,11 +550,14 @@ impl Session {
     pub async fn databases(&self) -> anyhow::Result<Vec<String>> {
         match &self.backend {
             Backend::Postgres(b) => b.databases().await,
+            Backend::MySql(b) => b.databases().await,
+            Backend::SqlServer(b) => b.databases().await,
             Backend::Sqlite(_) => Ok(vec![self.profile.database.clone()]),
         }
     }
 
-    /// User schemas first, then the system ones. SQLite has `main`.
+    /// User schemas first, then the system ones. SQLite has `main`; a MySQL
+    /// database is its own only schema.
     pub async fn schemas(&self) -> anyhow::Result<Vec<String>> {
         backend!(self, b => b.schemas().await)
     }
@@ -485,7 +579,7 @@ impl Session {
             .schemas()
             .await?
             .into_iter()
-            .filter(|s| s != "pg_catalog" && s != "information_schema")
+            .filter(|s| !is_system_schema(s))
             .take(40)
             .collect();
         let mut tables = vec![];
@@ -498,7 +592,7 @@ impl Session {
                 columns: t.columns.into_iter().map(|c| (c.name, c.data_type)).collect(),
             }));
         }
-        Ok(crate::complete::Catalog { schemas, tables })
+        Ok(crate::complete::Catalog { schemas, tables, engine: self.profile.engine })
     }
 
     /// Columns, indexes, constraints and DDL for a table or view.
@@ -506,11 +600,13 @@ impl Session {
         backend!(self, b => b.table_info(schema, name).await)
     }
 
-    /// The `CREATE FUNCTION` statement for a function (PostgreSQL only;
-    /// SQLite's catalog has no functions to list).
+    /// The `CREATE FUNCTION` (or procedure) statement for a routine. SQLite's
+    /// catalog has no functions to list.
     pub async fn function_ddl(&self, schema: &str, name: &str, args: &str) -> anyhow::Result<String> {
         match &self.backend {
             Backend::Postgres(b) => b.function_ddl(schema, name, args).await,
+            Backend::MySql(b) => b.function_ddl(schema, name).await,
+            Backend::SqlServer(b) => b.function_ddl(schema, name).await,
             Backend::Sqlite(_) => anyhow::bail!("SQLite has no stored functions"),
         }
     }
@@ -531,8 +627,10 @@ impl Session {
 
     /// Run one statement read-only with a timeout. For AI agents: a write
     /// fails (see [`needs_write_access`]), and so does anything that is not
-    /// exactly one statement. PostgreSQL enforces it with a read-only
-    /// transaction, SQLite with a connection opened read-only.
+    /// exactly one statement. PostgreSQL and MySQL enforce it with a
+    /// read-only transaction, SQLite with a connection opened read-only, and
+    /// SQL Server (which has no such thing) with Tabula's own check of the
+    /// statement inside a transaction that is always rolled back.
     pub async fn run_read_only(
         &self,
         sql: &str,
@@ -562,10 +660,17 @@ impl Session {
     /// The statement that shows the plan for `sql` as rows.
     pub fn explain_sql(&self, sql: &str) -> String {
         match self.profile.engine {
-            Engine::Postgres => format!("EXPLAIN {sql}"),
+            Engine::Postgres | Engine::MySql => format!("EXPLAIN {sql}"),
+            // SHOWPLAN has to be alone in its batch; `run` splits at GO.
+            Engine::SqlServer => format!("SET SHOWPLAN_TEXT ON\nGO\n{sql}\nGO\nSET SHOWPLAN_TEXT OFF"),
             Engine::Sqlite => format!("EXPLAIN QUERY PLAN {sql}"),
         }
     }
+}
+
+/// A schema of the database's own, listed after the user's.
+pub fn is_system_schema(schema: &str) -> bool {
+    matches!(schema, "pg_catalog" | "information_schema" | "INFORMATION_SCHEMA" | "sys")
 }
 
 /// Rows of `object`, a page at a time, for the Data tab.
@@ -579,15 +684,24 @@ pub fn browse_sql(
     limit: usize,
     offset: usize,
 ) -> String {
+    let quote = |name: &str| object.engine.quote_ident(name);
     let mut sql = format!("SELECT * FROM {}", object.qualified());
     if !filter.trim().is_empty() {
         sql.push_str(&format!(" WHERE {}", filter.trim()));
     }
     let mut by: Vec<String> = order
         .iter()
-        .map(|(col, asc)| format!("{} {}", quote_ident(col), if *asc { "ASC" } else { "DESC" }))
+        .map(|(col, asc)| format!("{} {}", quote(col), if *asc { "ASC" } else { "DESC" }))
         .collect();
-    by.extend(key.iter().filter(|k| order.is_none_or(|(c, _)| c != k.as_str())).map(|k| quote_ident(k)));
+    by.extend(key.iter().filter(|k| order.is_none_or(|(c, _)| c != k.as_str())).map(|k| quote(k)));
+    if object.engine == Engine::SqlServer {
+        // OFFSET … FETCH needs an ORDER BY; with no key, any order will do.
+        if by.is_empty() {
+            by.push("(SELECT NULL)".into());
+        }
+        sql.push_str(&format!(" ORDER BY {} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY", by.join(", ")));
+        return sql;
+    }
     if !by.is_empty() {
         sql.push_str(&format!(" ORDER BY {}", by.join(", ")));
     }
@@ -660,6 +774,7 @@ mod tests {
             rows_estimate: None,
             comment: None,
             signature: None,
+            engine: Engine::Postgres,
         };
         assert_eq!(
             browse_sql(&o, " quantity > 1 ", Some(("order_id", false)), &[], 100, 200),
@@ -899,6 +1014,368 @@ mod tests {
         });
     }
 
+    /// A session from a URL in `var`, or None to skip. The servers are
+    /// seeded with `scripts/seed-mysql.sql` / `scripts/seed-sqlserver.sql`.
+    fn server_session(var: &str) -> Option<Arc<Session>> {
+        let url = std::env::var(var).ok()?;
+        let (p, pw) = Profile::from_url("test", &url).unwrap();
+        Some(crate::rt::block_on(Session::connect(p, pw)).expect("connect"))
+    }
+
+    fn cell(c: &str, v: Option<&str>) -> Cell {
+        (c.to_string(), v.map(str::to_string))
+    }
+
+    /// Needs `TABULA_TEST_MYSQL_URL=mysql://root:tabula@localhost/shop`.
+    #[test]
+    fn mysql_against_a_server() {
+        let Some(s) = server_session("TABULA_TEST_MYSQL_URL") else {
+            eprintln!("TABULA_TEST_MYSQL_URL not set; skipped");
+            return;
+        };
+        crate::rt::block_on(async {
+            assert_eq!(s.schemas().await.unwrap(), vec!["shop"]);
+            let dbs = s.databases().await.unwrap();
+            assert_eq!(dbs.first().map(String::as_str), Some("shop"), "{dbs:?}");
+            assert!(dbs.last().is_some_and(|d| d == "sys"), "{dbs:?}");
+
+            let objs = s.objects("shop").await.unwrap();
+            let names: Vec<_> = objs.iter().map(|o| (o.name.as_str(), o.kind)).collect();
+            assert!(names.contains(&("orders", ObjectKind::Table)));
+            assert!(names.contains(&("order_totals", ObjectKind::View)));
+            let f = objs.iter().find(|o| o.name == "customer_order_count").unwrap();
+            assert_eq!((f.kind, f.signature.as_deref()), (ObjectKind::Function, Some("customer int")));
+            assert!(objs.iter().find(|o| o.name == "orders").unwrap().rows_estimate.is_some_and(|n| n > 50_000));
+            assert_eq!(objs[0].qualified(), "`shop`.`customers`");
+            assert!(s.function_ddl("shop", "customer_order_count", "").await.unwrap().contains("CREATE DEFINER"));
+
+            let info = s.table_info("shop", "orders").await.unwrap();
+            let col = |n: &str| info.columns.iter().find(|c| c.name == n).unwrap();
+            assert!(col("id").primary_key && col("id").data_type == "bigint" && !col("id").nullable);
+            assert_eq!(col("id").default.as_deref(), Some("auto_increment"));
+            assert_eq!(col("status").default.as_deref(), Some("'pending'"));
+            assert_eq!(col("placed_at").default.as_deref(), Some("CURRENT_TIMESTAMP"));
+            assert!(info.indexes[0].primary && info.indexes[0].definition == "PRIMARY KEY (`id`)");
+            let idx = info.indexes.iter().find(|i| i.name == "orders_placed_idx").unwrap();
+            assert_eq!(idx.definition, "CREATE INDEX `orders_placed_idx` ON `shop`.`orders` (`placed_at` DESC)");
+            let defs: Vec<_> = info.constraints.iter().map(|k| (k.kind.as_str(), k.definition.as_str())).collect();
+            assert!(defs.contains(&("p", "PRIMARY KEY (`id`)")), "{defs:?}");
+            assert!(defs.contains(&("f", "FOREIGN KEY (`customer_id`) REFERENCES `shop`.`customers` (`id`)")), "{defs:?}");
+            assert!(info.ddl.starts_with("CREATE TABLE `orders`"), "{}", info.ddl);
+            assert!(info.total_size.as_deref().is_some_and(|t| t.ends_with("MB")), "{:?}", info.total_size);
+            let items = s.table_info("shop", "order_items").await.unwrap();
+            assert!(items.constraints.iter().any(|k| k.definition.ends_with("ON DELETE CASCADE")), "{:?}", items.constraints);
+            let products = s.table_info("shop", "products").await.unwrap();
+            assert!(products.constraints.iter().any(|k| k.kind == "c" && k.definition.contains("price")), "{:?}", products.constraints);
+            let view = s.table_info("shop", "order_totals").await.unwrap();
+            assert!(view.kind == ObjectKind::View && view.ddl.contains("VIEW `order_totals`"), "{}", view.ddl);
+            assert!(s.table_info("shop", "nope").await.is_err());
+
+            // Several statements, NULLs, numbers, bytes and bits.
+            let out = s
+                .run("select 1 as a, null as b, 2.50 as c; select id from orders; select x'00ff' as raw, b'101' as bits, 'naïve' as t", 10)
+                .await
+                .unwrap();
+            assert_eq!(out.results.len(), 3);
+            assert_eq!(out.results[0].rows, vec![vec![Some("1".into()), None, Some("2.50".into())]]);
+            assert!(out.results[0].columns[0].is_numeric() && out.results[0].columns[2].is_numeric());
+            assert!(out.results[1].truncated && out.results[1].rows.len() == 10 && out.results[1].row_count == 100_000);
+            assert_eq!(out.results[2].rows[0], vec![Some("0x00FF".into()), Some("0x05".into()), Some("naïve".into())]);
+            let photo = s.run("select photo from products where id = 50", 1).await.unwrap();
+            assert!(photo.results[0].rows[0][0].as_deref().is_some_and(|p| p.starts_with("0x") && p.len() == 66));
+
+            // Writes report what they changed; DDL changes nothing.
+            let out = s
+                .run("create temporary table t (x int); insert into t values (1), (2), (3); update t set x = 0 where x > 1; drop temporary table t", 10)
+                .await
+                .unwrap();
+            let counts: Vec<u64> = out.results.iter().map(|r| r.row_count).collect();
+            assert_eq!(counts, vec![0, 3, 2, 0]);
+
+            // The Data tab's pages, and a transaction that spans runs.
+            let orders = DbObject { schema: "shop".into(), name: "orders".into(), kind: ObjectKind::Table, rows_estimate: None, comment: None, signature: None, engine: Engine::MySql };
+            let page = s.run(&browse_sql(&orders, "status = 'paid'", Some(("id", false)), &[], 3, 3), 3).await.unwrap();
+            let ids: Vec<_> = page.results[0].rows.iter().map(|r| r[0].clone().unwrap()).collect();
+            assert_eq!(ids, vec!["99985", "99981", "99977"]);
+            s.run("begin; update orders set note = 'x' where id = 1", 1).await.unwrap();
+            s.run("rollback", 1).await.unwrap();
+            assert_eq!(s.run("select note from orders where id = 1", 1).await.unwrap().results[0].rows, vec![vec![None]]);
+
+            let err = s.run("select * from nope", 10).await.unwrap_err();
+            assert!(err.to_string().starts_with("ERROR 1146 (42S02)"), "{err}");
+
+            // Agents: reads only, one statement, and the server refuses writes.
+            let t = Duration::from_secs(5);
+            assert!(s.run_read_only("select count(*) from orders", 10, t).await.is_ok());
+            for sql in ["delete from orders", "create table x (y int)", "with d as (select 1) update orders set note = 'x'", "select 1 into outfile '/tmp/x'"] {
+                let err = s.run_read_only(sql, 10, t).await.unwrap_err();
+                assert!(needs_write_access(&err), "{sql}: {err}");
+            }
+            let err = s.run_read_only("select 1; delete from orders", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("one statement"), "{err}");
+            // A function that writes, called from a SELECT, meets the read-only transaction.
+            s.run("create function tabula_writes() returns int deterministic modifies sql data begin update orders set note = 'w' where id = 1; return 1; end", 1).await.unwrap();
+            let err = s.run_read_only("select tabula_writes()", 10, t).await.unwrap_err();
+            assert!(needs_write_access(&err), "{err}");
+            s.run("drop function tabula_writes", 1).await.unwrap();
+            assert_eq!(s.run("select count(*) from orders where note = 'w'", 1).await.unwrap().results[0].rows[0][0].as_deref(), Some("0"));
+
+            let out = s.run_write("update orders set note = 'agent' where id <= 3", 10, t).await.unwrap();
+            assert_eq!(out.results[0].row_count, 3);
+            let err = s.run_write("begin", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("rolled back"), "{err}");
+            s.run("update orders set note = null where id <= 3", 1).await.unwrap();
+
+            let started = std::time::Instant::now();
+            let err = s.run_read_only("select sleep(5)", 10, Duration::from_millis(300)).await.unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(s.run_read_only("select 1", 10, t).await.is_ok());
+
+            let stop = s.canceller();
+            let running = tokio::spawn({
+                let s = s.clone();
+                async move { s.run("select sleep(10)", 10).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel().await.unwrap();
+            // SLEEP returns 1 when interrupted rather than failing.
+            let out = running.await.unwrap();
+            assert!(out.as_ref().is_err_and(|e| e.to_string() == "the query was stopped") || out.as_ref().is_ok_and(|o| o.results[0].rows[0][0].as_deref() == Some("1")), "{out:?}");
+            assert!(s.run("select 1", 1).await.is_ok());
+
+            let plan = s.plan("select * from orders where customer_id = 7", false, t).await.unwrap();
+            assert!(plan.contains("orders_customer_idx"), "{plan}");
+            let plan = s.plan("select * from orders where customer_id = 7", true, t).await.unwrap();
+            assert!(plan.contains("actual time"), "{plan}");
+            let explain = s.run(&s.explain_sql("select * from orders where id = 1"), 10).await.unwrap();
+            assert!(explain.results[0].has_rows());
+
+            let (tables, keys) = s.schema_map("shop").await.unwrap();
+            assert!(tables.iter().find(|t| t.name == "orders").unwrap().columns.iter().any(|c| c.name == "id" && c.primary_key));
+            let fk = keys.iter().find(|k| k.from_table == "order_items" && k.to_table == "orders").unwrap();
+            assert_eq!((fk.from_cols.clone(), fk.to_schema.as_str()), (vec!["order_id".to_string()], "shop"));
+            let catalog = s.completion_catalog().await.unwrap();
+            let (_, found) = crate::complete::suggest(&catalog, "select o.cu from orders o", 11, None);
+            assert_eq!(found[0].insert, "customer_id");
+
+            // Row edits, on a table made for them.
+            s.run("drop table if exists tabula_edit; create table tabula_edit (id int auto_increment primary key, title varchar(50) not null, price decimal(10,2), raw varbinary(8), note text)", 1).await.unwrap();
+            let info = s.table_info("shop", "tabula_edit").await.unwrap();
+            let target = EditTarget::new(Engine::MySql, "`shop`.`tabula_edit`".into(), &info.columns);
+            let n = s
+                .apply(&target, &[
+                    Change::Insert { values: vec![cell("title", Some("Mug")), cell("price", Some("4.50")), cell("raw", Some("0x00FF"))] },
+                    Change::Insert { values: vec![] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("It's a \\ mug")), cell("price", None)] },
+                    // Unchanged still counts as the one row it matched.
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("note", None)] },
+                ])
+                .await;
+            // The empty insert has no title, which is NOT NULL: nothing is saved.
+            let err = n.unwrap_err();
+            assert!(err.to_string().contains("change 2 of 4") && err.to_string().contains("nothing was saved"), "{err}");
+            assert_eq!(s.run("select count(*) from tabula_edit", 1).await.unwrap().results[0].rows[0][0].as_deref(), Some("0"));
+            let n = s
+                .apply(&target, &[
+                    Change::Insert { values: vec![cell("title", Some("Mug")), cell("price", Some("4.50")), cell("raw", Some("0x00FF"))] },
+                    Change::Update { key: vec![cell("id", Some("2"))], set: vec![cell("title", Some("It's a \\ mug")), cell("price", None)] },
+                    Change::Update { key: vec![cell("id", Some("2"))], set: vec![cell("note", None)] },
+                ])
+                .await
+                .unwrap();
+            assert_eq!(n, 3);
+            s.run("alter table tabula_edit add bits bit(3) not null default b'101'", 1).await.unwrap();
+            let row = s.run("select bits from tabula_edit", 1).await.unwrap();
+            assert_eq!(row.results[0].rows[0][0].as_deref(), Some("5"));
+            let row = s.run("select title, price, raw from tabula_edit", 1).await.unwrap();
+            assert_eq!(row.results[0].rows[0], vec![Some("It's a \\ mug".into()), None, Some("0x00FF".into())]);
+            assert_eq!(
+                target.preview(&Change::Update { key: vec![cell("id", Some("2"))], set: vec![cell("title", Some("a\\b")), cell("raw", Some("0x01"))] }),
+                "UPDATE `shop`.`tabula_edit` SET `title` = 'a\\\\b', `raw` = 0x01 WHERE `id` = '2';"
+            );
+            let err = s.apply(&target, &[Change::Delete { key: vec![cell("id", Some("99"))] }]).await.unwrap_err();
+            assert!(err.to_string().contains("matched 0 rows"), "{err}");
+            s.run("drop table tabula_edit", 1).await.unwrap();
+
+            // Another database on the same server.
+            let other = s.reconnect_to("mysql").await.unwrap();
+            assert_eq!(other.schemas().await.unwrap(), vec!["mysql"]);
+        });
+    }
+
+    /// Needs `TABULA_TEST_SQLSERVER_URL=sqlserver://sa:<password>@localhost/shop`.
+    #[test]
+    fn sql_server_against_a_server() {
+        let Some(s) = server_session("TABULA_TEST_SQLSERVER_URL") else {
+            eprintln!("TABULA_TEST_SQLSERVER_URL not set; skipped");
+            return;
+        };
+        crate::rt::block_on(async {
+            let schemas = s.schemas().await.unwrap();
+            assert_eq!(&schemas[..2], ["dbo", "shop"], "{schemas:?}");
+            assert_eq!(schemas[schemas.len() - 2..], ["INFORMATION_SCHEMA", "sys"], "{schemas:?}");
+            assert!(s.databases().await.unwrap().contains(&"master".to_string()));
+
+            let objs = s.objects("shop").await.unwrap();
+            let names: Vec<_> = objs.iter().map(|o| (o.name.as_str(), o.kind)).collect();
+            assert!(names.contains(&("orders", ObjectKind::Table)));
+            assert!(names.contains(&("order_totals", ObjectKind::View)));
+            assert!(names.contains(&("invoice_numbers", ObjectKind::Sequence)));
+            let f = objs.iter().find(|o| o.name == "customer_order_count").unwrap();
+            assert_eq!(f.signature.as_deref(), Some("@customer int"));
+            assert_eq!(objs.iter().find(|o| o.name == "orders").unwrap().rows_estimate, Some(100_000));
+            assert_eq!(objs.iter().find(|o| o.name == "customers").unwrap().comment.as_deref(), Some("People who have an account"));
+            assert!(s.function_ddl("shop", "customer_order_count", "").await.unwrap().starts_with("CREATE FUNCTION"));
+
+            let info = s.table_info("shop", "orders").await.unwrap();
+            let col = |n: &str| info.columns.iter().find(|c| c.name == n).unwrap();
+            assert!(col("id").primary_key && col("id").data_type == "bigint" && !col("id").nullable);
+            assert_eq!(col("id").default.as_deref(), Some("IDENTITY(1,1)"));
+            assert_eq!(col("status").data_type, "varchar(10)");
+            assert_eq!(col("placed_at").data_type, "datetime2(3)");
+            assert_eq!(col("status").default.as_deref(), Some("('pending')"));
+            assert_eq!(info.indexes[0].definition, "PRIMARY KEY CLUSTERED ([id])");
+            let idx = info.indexes.iter().find(|i| i.name == "orders_placed_idx").unwrap();
+            assert_eq!(idx.definition, "CREATE NONCLUSTERED INDEX [orders_placed_idx] ON [shop].[orders] ([placed_at] DESC) INCLUDE ([status])");
+            let defs: Vec<_> = info.constraints.iter().map(|k| (k.kind.as_str(), k.definition.as_str())).collect();
+            assert!(defs.contains(&("f", "FOREIGN KEY ([customer_id]) REFERENCES [shop].[customers] ([id])")), "{defs:?}");
+            assert!(defs.iter().any(|(k, d)| *k == "c" && d.starts_with("CHECK (")), "{defs:?}");
+            assert!(info.ddl.starts_with("CREATE TABLE [shop].[orders] (\n    [id] bigint IDENTITY(1,1) NOT NULL,"), "{}", info.ddl);
+            assert!(info.ddl.contains("CONSTRAINT [orders_pkey] PRIMARY KEY CLUSTERED ([id])"), "{}", info.ddl);
+            assert!(info.ddl.ends_with("INCLUDE ([status]);"), "{}", info.ddl);
+            assert!(info.total_size.is_some());
+            let items = s.table_info("shop", "order_items").await.unwrap();
+            assert!(items.constraints.iter().any(|k| k.definition.ends_with("ON DELETE CASCADE")), "{:?}", items.constraints);
+            let view = s.table_info("shop", "order_totals").await.unwrap();
+            assert!(view.kind == ObjectKind::View && view.ddl.starts_with("CREATE VIEW shop.order_totals"), "{}", view.ddl);
+
+            // Batches, several result sets, and how values read.
+            let out = s
+                .run("select 1 as a, null as b, cast(2.5 as decimal(5,2)) as c\nselect id from shop.orders\nGO\nselect cast('2024-01-02 03:04:05.1234567' as datetime2) as d2, cast('2024-01-02 03:04:05.123' as datetime) as dt, cast('2024-01-02' as date) as d, cast(0x00FF as varbinary(2)) as raw, cast(1 as bit) as b, N'naïve' as t, cast('6F9619FF-8B86-D011-B42D-00C04FC964FF' as uniqueidentifier) as g, cast('2024-01-02 03:04:05 +02:00' as datetimeoffset(0)) as o", 10)
+                .await
+                .unwrap();
+            assert_eq!(out.results.len(), 3);
+            assert_eq!(out.results[0].rows, vec![vec![Some("1".into()), None, Some("2.50".into())]]);
+            assert!(out.results[0].columns[0].is_numeric() && out.results[0].columns[2].is_numeric());
+            assert!(out.results[1].truncated && out.results[1].rows.len() == 10 && out.results[1].row_count == 100_000);
+            let expect = ["2024-01-02 03:04:05.1234567", "2024-01-02 03:04:05.123", "2024-01-02", "0x00FF", "1", "naïve", "6F9619FF-8B86-D011-B42D-00C04FC964FF", "2024-01-02 03:04:05 +02:00"];
+            assert_eq!(out.results[2].rows[0], expect.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>());
+
+            let out = s
+                .run("create table #t (x int); insert #t values (1), (2), (3)\nGO\nupdate #t set x = 0 where x > 1\nGO\ndrop table #t", 10)
+                .await
+                .unwrap();
+            let counts: Vec<u64> = out.results.iter().map(|r| r.row_count).collect();
+            assert_eq!(counts, vec![3, 2, 0]);
+
+            let orders = DbObject { schema: "shop".into(), name: "orders".into(), kind: ObjectKind::Table, rows_estimate: None, comment: None, signature: None, engine: Engine::SqlServer };
+            let sql = browse_sql(&orders, "status = 'paid'", Some(("id", false)), &[], 3, 3);
+            assert_eq!(sql, "SELECT * FROM [shop].[orders] WHERE status = 'paid' ORDER BY [id] DESC OFFSET 3 ROWS FETCH NEXT 3 ROWS ONLY");
+            let page = s.run(&sql, 3).await.unwrap();
+            let ids: Vec<_> = page.results[0].rows.iter().map(|r| r[0].clone().unwrap()).collect();
+            assert_eq!(ids, vec!["99985", "99981", "99977"]);
+            assert!(s.run(&browse_sql(&orders, "", None, &[], 5, 0), 5).await.is_ok());
+            s.run("begin transaction; update shop.orders set note = 'x' where id = 1", 1).await.unwrap();
+            s.run("rollback", 1).await.unwrap();
+            assert_eq!(s.run("select note from shop.orders where id = 1", 1).await.unwrap().results[0].rows, vec![vec![None]]);
+
+            let err = s.run("select * from nope", 10).await.unwrap_err();
+            assert!(err.to_string().starts_with("Msg 208, Level 16"), "{err}");
+
+            let t = Duration::from_secs(5);
+            assert!(s.run_read_only("select count(*) from shop.orders", 10, t).await.is_ok());
+            for sql in ["delete from shop.orders", "select 1 delete from shop.orders", "exec sp_who", "select * into #x from shop.orders", "select next value for shop.invoice_numbers"] {
+                let err = s.run_read_only(sql, 10, t).await.unwrap_err();
+                assert!(needs_write_access(&err), "{sql}: {err}");
+            }
+            assert!(s.run_read_only("select 1; select 2", 10, t).await.unwrap_err().to_string().contains("one statement"));
+            assert_eq!(s.run("select count(*) from shop.orders", 1).await.unwrap().results[0].rows[0][0].as_deref(), Some("100000"));
+
+            let out = s.run_write("update shop.orders set note = 'agent' where id <= 3", 10, t).await.unwrap();
+            assert_eq!(out.results[0].row_count, 3);
+            let err = s.run_write("begin transaction; delete from shop.order_items", 10, t).await.unwrap_err();
+            assert!(err.to_string().contains("rolled back"), "{err}");
+            assert_eq!(s.run("select count(*) from shop.order_items", 1).await.unwrap().results[0].rows[0][0].as_deref(), Some("100000"));
+            s.run("update shop.orders set note = null where id <= 3", 1).await.unwrap();
+
+            let started = std::time::Instant::now();
+            let err = s.run_read_only("with g(n) as (select 1 union all select n + 1 from g where n < 100000000) select count(*) from g option (maxrecursion 0)", 10, Duration::from_millis(300)).await.unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+            assert!(s.run_read_only("select 1", 10, t).await.is_ok());
+
+            // Stop ends the query by closing its connection.
+            s.run("begin transaction; update shop.orders set note = 'kept' where id = 5", 1).await.unwrap();
+            let started = std::time::Instant::now();
+            let stop = s.canceller();
+            let running = tokio::spawn({
+                let s = s.clone();
+                async move { s.run("waitfor delay '00:00:10'", 10).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel().await.unwrap();
+            let err = running.await.unwrap().unwrap_err();
+            assert!(err.to_string().starts_with("the query was stopped"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            // The next query connects again; what was left open is gone.
+            let after = s.run("select @@trancount, note from shop.orders where id = 5", 1).await.unwrap();
+            assert_eq!(after.results[0].rows[0], vec![Some("0".into()), None]);
+
+            let plan = s.plan("select * from shop.orders where customer_id = 7", false, t).await.unwrap();
+            assert!(plan.contains("orders_customer_idx"), "{plan}");
+            let plan = s.plan("select count(*) from shop.orders where customer_id = 7", true, t).await.unwrap();
+            assert!(plan.contains("actual rows="), "{plan}");
+            let explain = s.run(&s.explain_sql("select * from shop.orders where id = 1"), 10).await.unwrap();
+            assert!(explain.results.iter().any(|r| r.has_rows()), "{explain:?}");
+
+            let (tables, keys) = s.schema_map("shop").await.unwrap();
+            assert!(tables.iter().find(|t| t.name == "orders").unwrap().columns.iter().any(|c| c.name == "id" && c.primary_key && !c.nullable));
+            let fk = keys.iter().find(|k| k.from_table == "order_items" && k.to_table == "products").unwrap();
+            assert_eq!(fk.from_cols, vec!["product_id"]);
+            let catalog = s.completion_catalog().await.unwrap();
+            assert!(!catalog.schemas.contains(&"sys".to_string()));
+            let (_, found) = crate::complete::suggest(&catalog, "select o.cu from shop.orders o", 11, None);
+            assert_eq!(found[0].insert, "customer_id");
+
+            s.run("drop table if exists dbo.tabula_edit; create table dbo.tabula_edit (id int identity primary key, title nvarchar(50) not null, price decimal(10,2), raw varbinary(8), at datetime2, flag bit)", 1).await.unwrap();
+            let info = s.table_info("dbo", "tabula_edit").await.unwrap();
+            let target = EditTarget::new(Engine::SqlServer, "[dbo].[tabula_edit]".into(), &info.columns);
+            let n = s
+                .apply(&target, &[
+                    Change::Insert { values: vec![cell("title", Some("Mug ☕")), cell("price", Some("4.50")), cell("raw", Some("0x00FF")), cell("at", Some("2024-01-02 03:04:05.5")), cell("flag", Some("1"))] },
+                    Change::Insert { values: vec![cell("title", Some("Cup"))] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("It's a mug")), cell("price", None)] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("price", None)] },
+                    Change::Delete { key: vec![cell("id", Some("2"))] },
+                ])
+                .await
+                .unwrap();
+            assert_eq!(n, 5);
+            let row = s.run("select title, price, raw, at, flag from dbo.tabula_edit", 5).await.unwrap();
+            assert_eq!(row.results[0].rows, vec![vec![Some("It's a mug".into()), None, Some("0x00FF".into()), Some("2024-01-02 03:04:05.5000000".into()), Some("1".into())]]);
+            let err = s
+                .apply(&target, &[
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("changed"))] },
+                    Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("price", Some("not a number"))] },
+                ])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("nothing was saved"), "{err}");
+            let err = s.apply(&target, &[Change::Delete { key: vec![cell("id", Some("99"))] }]).await.unwrap_err();
+            assert!(err.to_string().contains("matched 0 rows"), "{err}");
+            assert_eq!(s.run("select title from dbo.tabula_edit", 1).await.unwrap().results[0].rows[0][0].as_deref(), Some("It's a mug"));
+            assert_eq!(
+                target.preview(&Change::Update { key: vec![cell("id", Some("1"))], set: vec![cell("title", Some("ü")), cell("raw", Some("0x01"))] }),
+                "UPDATE [dbo].[tabula_edit] SET [title] = N'ü', [raw] = 0x01 WHERE [id] = N'1';"
+            );
+            s.run("drop table dbo.tabula_edit", 1).await.unwrap();
+
+            let other = s.reconnect_to("master").await.unwrap();
+            assert_eq!(other.profile.database, "master");
+        });
+    }
+
     fn sqlite_session() -> (tempfile::TempDir, Arc<Session>) {
         let (dir, path) = sqlite::demo_database();
         let s = crate::rt::block_on(Session::connect(Profile::sqlite("shop", &path), None)).expect("connect");
@@ -1012,6 +1489,7 @@ mod tests {
                 rows_estimate: None,
                 comment: None,
                 signature: None,
+                engine: Engine::Sqlite,
             };
             let page = s.run(&browse_sql(&orders, "status = 'paid'", Some(("id", false)), &[], 3, 3), 3).await.unwrap();
             let ids: Vec<_> = page.results[0].rows.iter().map(|r| r[0].clone().unwrap()).collect();

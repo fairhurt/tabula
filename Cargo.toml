@@ -1,6 +1,6 @@
 [package]
 name = "tabula"
-description = "A PostgreSQL and SQLite viewer and query tool built with GPUI Kit, with an MCP server so AI agents can use it."
+description = "A PostgreSQL, MySQL, SQL Server and SQLite viewer and query tool built with GPUI Kit, with an MCP server so AI agents can use it."
 version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -29,6 +29,16 @@ lsp-types = { version = "0.97", features = ["proposed"] }
 github-copilot-sdk = { version = "1.0.31", default-features = false, features = ["runtime"] }
 # SQLite itself is compiled in, so there is nothing to install.
 rusqlite = { version = "0.43", features = ["bundled", "column_decltype", "hooks", "limits"] }
+# MySQL / MariaDB, pure Rust apart from TLS (which is native-tls, like PostgreSQL's).
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "native-tls-tls"] }
+# SQL Server over TDS. tiberius wants futures-io streams, hence tokio-util's compat.
+tiberius = { version = "0.13", default-features = false, features = ["tds80", "native-tls", "chrono", "sql-browser-tokio"] }
+
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows sign-in for SQL Server: a connection with no user name.
+tiberius = { version = "0.13", default-features = false, features = ["winauth"] }
 
 [build-dependencies]
 resvg = { version = "0.45", default-features = false }
