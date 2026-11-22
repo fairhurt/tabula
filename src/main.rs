@@ -1,8 +1,9 @@
-//! Tabula: a PostgreSQL and SQLite viewer and query tool built with GPUI
-//! Kit, that AI agents can use too.
+//! Tabula: a PostgreSQL, MySQL, SQL Server and SQLite viewer and query tool
+//! built with GPUI Kit, that AI agents can use too.
 //!
 //!   tabula                                  open the app
 //!   tabula --url postgres://…               open the app and connect
+//!                                           (or mysql://…, sqlserver://…)
 //!   tabula --url sqlite:/path/to/file.db    (or just the file's path)
 //!   tabula --connect NAME                   open the app on a saved connection
 //!   tabula mcp [--connection NAME]          MCP server on stdio, for agents
@@ -102,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         Some("mcp") => mcp::Server::new(flag("--connection")).serve_stdio(),
         Some("add") => {
             let (Some(name), Some(url)) = (args.get(1), args.get(2)) else {
-                bail!("usage: tabula add NAME postgres://user:pass@host/db [--ai off|read-only|ask|read-write]\n       tabula add NAME sqlite:/path/to/file.db [--ai …]");
+                bail!("usage: tabula add NAME postgres://user:pass@host/db [--ai off|read-only|ask|read-write]\n       tabula add NAME mysql://… or sqlserver://… [--ai …]\n       tabula add NAME sqlite:/path/to/file.db [--ai …]");
             };
             let (mut p, pw) = Profile::from_url(name, url)?;
             p.ai = match flag("--ai").as_deref() {

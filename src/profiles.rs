@@ -1,5 +1,6 @@
 //! Saved connection profiles (`<config>/tabula/connections.json`) and their
-//! passwords. A profile is a PostgreSQL server or a SQLite file.
+//! passwords. A profile is a PostgreSQL, MySQL or SQL Server server, or a
+//! SQLite file.
 //!
 //! Passwords never go in the profiles file. On Windows and macOS they live in
 //! the OS credential store; on Linux in `secrets.json` next to the profiles,
@@ -16,16 +17,69 @@ use serde::{Deserialize, Serialize};
 pub enum Engine {
     #[default]
     Postgres,
+    /// MySQL, and MariaDB, which speaks the same protocol.
+    #[serde(rename = "mysql")]
+    MySql,
+    #[serde(rename = "sqlserver")]
+    SqlServer,
     Sqlite,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 2] = [Engine::Postgres, Engine::Sqlite];
+    pub const ALL: [Engine; 4] = [Engine::Postgres, Engine::MySql, Engine::SqlServer, Engine::Sqlite];
 
     pub fn label(self) -> &'static str {
         match self {
             Engine::Postgres => "PostgreSQL",
+            Engine::MySql => "MySQL",
+            Engine::SqlServer => "SQL Server",
             Engine::Sqlite => "SQLite",
+        }
+    }
+
+    /// A server to connect to, rather than a file.
+    pub fn is_server(self) -> bool {
+        self != Engine::Sqlite
+    }
+
+    /// The port a server listens on unless told otherwise.
+    pub fn default_port(self) -> u16 {
+        match self {
+            Engine::Postgres => 5432,
+            Engine::MySql => 3306,
+            Engine::SqlServer => 1433,
+            Engine::Sqlite => 0,
+        }
+    }
+
+    /// The administrator a fresh install comes with.
+    pub fn default_user(self) -> &'static str {
+        match self {
+            Engine::Postgres => "postgres",
+            Engine::MySql => "root",
+            Engine::SqlServer => "sa",
+            Engine::Sqlite => "",
+        }
+    }
+
+    /// The schema unqualified names resolve to, so completion can leave it off.
+    pub fn default_schema(self) -> &'static str {
+        match self {
+            Engine::Postgres => "public",
+            Engine::SqlServer => "dbo",
+            Engine::Sqlite => "main",
+            // A MySQL database is its own (only) schema.
+            Engine::MySql => "",
+        }
+    }
+
+    /// An identifier quoted in the engine's own syntax: `"name"`, MySQL's
+    /// `` `name` ``, or SQL Server's `[name]`. Quotes inside are doubled.
+    pub fn quote_ident(self, s: &str) -> String {
+        match self {
+            Engine::Postgres | Engine::Sqlite => format!("\"{}\"", s.replace('"', "\"\"")),
+            Engine::MySql => format!("`{}`", s.replace('`', "``")),
+            Engine::SqlServer => format!("[{}]", s.replace(']', "]]")),
         }
     }
 }
@@ -102,8 +156,9 @@ impl AiAccess {
     }
 }
 
-/// The server fields (`host`, `port`, `user`, `ssl`) are PostgreSQL's; a
-/// SQLite profile leaves them empty and keeps the file's path in `database`.
+/// The server fields (`host`, `port`, `user`, `ssl`) are for PostgreSQL,
+/// MySQL and SQL Server; a SQLite profile leaves them empty and keeps the
+/// file's path in `database`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -158,7 +213,21 @@ impl Profile {
         }
     }
 
-    /// Parse `postgres://user:pass@host:port/db?sslmode=…`, or for SQLite
+    /// The empty form for a server of `engine`: localhost, its usual port and
+    /// administrator. MySQL and SQL Server start with no database, which
+    /// means the login's default one.
+    pub fn server(engine: Engine) -> Profile {
+        Profile {
+            engine,
+            port: engine.default_port(),
+            user: engine.default_user().into(),
+            database: if engine == Engine::Postgres { "postgres".into() } else { String::new() },
+            ..Profile::default()
+        }
+    }
+
+    /// Parse `postgres://user:pass@host:port/db?sslmode=…` (or `mysql://`,
+    /// `mariadb://`, `sqlserver://`, `mssql://` in the same shape), or for SQLite
     /// `sqlite:/path/to/file.db` or just the path of an existing file.
     /// Returns the profile and the password, if the URL has one.
     pub fn from_url(name: &str, s: &str) -> anyhow::Result<(Profile, Option<String>)> {
@@ -169,9 +238,12 @@ impl Profile {
             return Ok((Profile::sqlite(name, &path), None));
         }
         let u = url::Url::parse(s).context("not a valid URL")?;
-        if !matches!(u.scheme(), "postgres" | "postgresql") {
-            bail!("the URL should start with postgres:// or sqlite:");
-        }
+        let engine = match u.scheme() {
+            "postgres" | "postgresql" => Engine::Postgres,
+            "mysql" | "mariadb" => Engine::MySql,
+            "sqlserver" | "mssql" => Engine::SqlServer,
+            _ => bail!("the URL should start with postgres://, mysql://, sqlserver:// or sqlite:"),
+        };
         let decode = |v: &str| {
             url::form_urlencoded::parse(format!("x={v}").as_bytes())
                 .next()
@@ -181,8 +253,8 @@ impl Profile {
         let mut p = Profile {
             name: name.to_string(),
             host: u.host_str().unwrap_or("localhost").to_string(),
-            port: u.port().unwrap_or(5432),
-            ..Profile::default()
+            port: u.port().unwrap_or(engine.default_port()),
+            ..Profile::server(engine)
         };
         if !u.username().is_empty() {
             p.user = decode(u.username());
@@ -192,27 +264,36 @@ impl Profile {
             p.database = decode(db);
         }
         for (k, v) in u.query_pairs() {
-            if k == "sslmode" {
-                p.ssl = match v.as_ref() {
-                    "disable" => SslMode::Disable,
-                    "require" => SslMode::Require,
-                    "verify-ca" | "verify-full" | "verify" => SslMode::Verify,
+            // libpq's sslmode, MySQL's ssl-mode, and SQL Server's encrypt.
+            let k = k.to_ascii_lowercase().replace('_', "-");
+            if matches!(k.as_str(), "sslmode" | "ssl-mode" | "encrypt") {
+                p.ssl = match v.to_ascii_lowercase().as_str() {
+                    "disable" | "disabled" | "false" | "no" => SslMode::Disable,
+                    "require" | "required" | "true" | "yes" | "mandatory" => SslMode::Require,
+                    "verify-ca" | "verify-full" | "verify" | "verify-identity" | "strict" => SslMode::Verify,
                     _ => SslMode::Prefer,
                 };
             }
         }
         if p.name.is_empty() {
-            p.name = format!("{}@{}", p.database, p.host);
+            p.name = p.default_name();
         }
         Ok((p, u.password().map(decode)))
     }
 
+    /// `database@host`, or just the host when no database is named.
+    pub fn default_name(&self) -> String {
+        if self.database.is_empty() {
+            self.host.clone()
+        } else {
+            format!("{}@{}", self.database, self.host)
+        }
+    }
+
     pub fn summary(&self) -> String {
         match self.engine {
-            Engine::Postgres => {
-                format!("{}@{}:{}/{}", self.user, self.host, self.port, self.database)
-            }
             Engine::Sqlite => self.database.clone(),
+            _ => format!("{}@{}:{}/{}", self.user, self.host, self.port, self.database),
         }
     }
 
@@ -220,8 +301,8 @@ impl Profile {
     /// a toolbar, so a SQLite file goes by its file name.
     pub fn database_label(&self) -> String {
         match self.engine {
-            Engine::Postgres => self.database.clone(),
             Engine::Sqlite => file_name(&self.database),
+            _ => self.database.clone(),
         }
     }
 
@@ -414,7 +495,34 @@ mod tests {
         // Saved as a plain word, and older files without it still load.
         assert_eq!(serde_json::to_string(&SslMode::Verify).unwrap(), "\"verify\"");
         assert_eq!(p.name, "shop@db.example.com");
-        assert!(Profile::from_url("x", "mysql://a@b/c").is_err());
+        assert!(Profile::from_url("x", "oracle://a@b/c").is_err());
+    }
+
+    #[test]
+    fn parses_mysql_and_sql_server_urls() {
+        let (p, pw) = Profile::from_url("", "mysql://app:s%3Acret@db.internal/shop?ssl-mode=REQUIRED").unwrap();
+        assert_eq!((p.engine, p.port, p.user.as_str(), p.database.as_str()), (Engine::MySql, 3306, "app", "shop"));
+        assert_eq!((p.ssl, pw.as_deref()), (SslMode::Require, Some("s:cret")));
+        assert_eq!(p.name, "shop@db.internal");
+        let (p, _) = Profile::from_url("", "mariadb://db.internal:3307").unwrap();
+        assert_eq!((p.engine, p.port, p.user.as_str(), p.database.as_str()), (Engine::MySql, 3307, "root", ""));
+        assert_eq!(p.name, "db.internal");
+
+        let (p, _) = Profile::from_url("", "sqlserver://sa@sql.example.com/Sales?encrypt=strict").unwrap();
+        assert_eq!((p.engine, p.port, p.database.as_str(), p.ssl), (Engine::SqlServer, 1433, "Sales", SslMode::Verify));
+        let (p, _) = Profile::from_url("x", "mssql://localhost").unwrap();
+        assert_eq!((p.engine, p.user.as_str(), p.ssl), (Engine::SqlServer, "sa", SslMode::Prefer));
+
+        // Saved under short, stable names.
+        assert_eq!(serde_json::to_string(&Engine::MySql).unwrap(), "\"mysql\"");
+        assert_eq!(serde_json::to_string(&Engine::SqlServer).unwrap(), "\"sqlserver\"");
+    }
+
+    #[test]
+    fn quotes_identifiers_per_engine() {
+        assert_eq!(Engine::Postgres.quote_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(Engine::MySql.quote_ident("a`b"), "`a``b`");
+        assert_eq!(Engine::SqlServer.quote_ident("a]b"), "[a]]b]");
     }
 
     #[test]

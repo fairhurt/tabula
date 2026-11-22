@@ -4,13 +4,15 @@
 
 # Tabula
 
-**A fast, native PostgreSQL and SQLite client — that your AI agents can use too.**
+**A fast, native PostgreSQL, MySQL, SQL Server and SQLite client — that your AI agents can use too.**
 
 In the spirit of pgAdmin and HeidiSQL, built in Rust with [GPUI Kit](https://gpui-kit.com).
 Claude Code and GitHub Copilot CLI can explore and query your databases through Tabula, on your own subscription.
 
 ![Rust](https://img.shields.io/badge/Rust-1.97+-b7410e?logo=rust&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-tested%20on%2017-336791?logo=postgresql&logoColor=white)
+![MySQL](https://img.shields.io/badge/MySQL-tested%20on%208.4-4479a1?logo=mysql&logoColor=white)
+![SQL Server](https://img.shields.io/badge/SQL%20Server-tested%20on%202022-cc2927?logo=microsoftsqlserver&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-built%20in-003b57?logo=sqlite&logoColor=white)
 ![GPUI Kit](https://img.shields.io/badge/UI-GPUI%20Kit-2563eb)
 ![MCP](https://img.shields.io/badge/MCP-server-6d28d9)
@@ -39,7 +41,7 @@ Tabula checks for a newer release when it starts. When there is one, the status 
 <td width="50%" valign="top">
 
 ### 🗂️ Browse everything
-Connections → databases → schemas → tables, views, materialized views, functions and sequences, with row estimates. A SQLite file opens the same way, its tables right under the connection. Double-click a table to page through its rows; right-click anything for more.
+Connections → databases → schemas → tables, views, materialized views, functions and sequences, with row estimates. MySQL and SQL Server servers open the same way (a MySQL database's tables sit right under it), and so does a SQLite file, its tables right under the connection. Double-click a table to page through its rows; right-click anything for more.
 
 </td>
 <td width="50%" valign="top">
@@ -116,6 +118,40 @@ Everything else works the same: Data with in-place editing, Structure, the schem
 - Foreign keys are enforced on Tabula's connections. `PRAGMA foreign_keys = OFF` in a query tab turns that off for your queries until you reconnect.
 - Edits are saved as plain values and the column's type decides how they are stored, as with any SQLite statement. BLOBs show as `x'…'` hex; one longer than 256 bytes is shown cut short and can't be saved from the grid.
 
+## 🐬 MySQL and SQL Server
+
+Pick **MySQL** or **SQL Server** under **New connection** (the port and user switch to the usual ones), or paste a URL:
+
+```sh
+tabula --url mysql://root:secret@localhost/shop          # MariaDB too; mariadb:// works as well
+tabula --url sqlserver://sa:secret@localhost/Sales       # mssql:// works as well
+```
+
+Leave the database empty to start in the login's default one (for MySQL, your first database) and browse the rest from the tree. For SQL Server, `host\INSTANCE` finds a named instance through the SQL Server Browser, and on Windows an empty user name signs in as you (Windows authentication).
+
+<table>
+<tr>
+<td width="50%"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/mysql-dark.png">
+  <img src="docs/mysql-light.png" alt="A MySQL server in Tabula: its databases in the tree, browsing shop.orders">
+</picture></td>
+<td width="50%"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/sqlserver-dark.png">
+  <img src="docs/sqlserver-light.png" alt="SQL Server in Tabula: the Structure of shop.orders with its indexes, constraints and CREATE TABLE">
+</picture></td>
+</tr>
+<tr>
+<td align="center"><sub>MySQL 8.4</sub></td>
+<td align="center"><sub>SQL Server 2022</sub></td>
+</tr>
+</table>
+
+Everything works as it does for PostgreSQL: Data with in-place editing, Structure, the schema map, completion, Stop, Plan, history, Ask AI and the agent tools. Each engine gets its own quoting (`` `name` ``, `[name]`), paging and literals, so previews and Review SQL show statements you could paste into its own shell. Some things follow from the engines:
+
+- **MySQL**: a database is a schema, so the tree goes server → database → tables. Your queries run on a connection of their own (so a `BEGIN` in a query tab is yours), while the tree, edits and agents share a small pool, so a slow query never holds up the tree. Stop sends `KILL QUERY`. Plan uses `EXPLAIN FORMAT=TREE` (or `EXPLAIN ANALYZE`), and the classic table on MariaDB. Binary columns show as `0x…` hex, `BIT` columns as numbers.
+- **SQL Server**: scripts split at `GO` lines into batches, as in SSMS and sqlcmd. Plan shows `SHOWPLAN_TEXT` (nothing runs), or with **analyze** the actual rows per step. Stop ends the query by closing its connection (the driver can't cancel a running query and keep the connection), so a transaction left open in that tab is rolled back; the next query reconnects. A batch that returns no rows reports the last statement's row count.
+- Edits are bound as text and converted by the server, as when you type a value into SSMS or Workbench. Binary values are written as `0x…`; one shown cut short (over 256 bytes) can't be saved from the grid.
+
 ## 🤖 Ask AI
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>. The agent looks things up with Tabula's tools (you see each call) before it answers. Query tabs add **Explain**, **Optimize** and, after an error, **Fix with AI**. <kbd>Ctrl</kbd>+<kbd>K</kbd> in the editor jumps straight to the panel.
@@ -164,7 +200,7 @@ The same dialog sets how the connection is secured:
 | AI access | Agents can… |
 | --- | --- |
 | **Off** | Nothing — the connection is hidden from them |
-| **Read only** *(default)* | Read, one statement at a time, with a 30 s timeout: in a read-only transaction on PostgreSQL, on a read-only connection on SQLite |
+| **Read only** *(default)* | Read, one statement at a time, with a 30 s timeout: in a read-only transaction on PostgreSQL and MySQL, on a read-only connection on SQLite, and on SQL Server one checked SELECT in a transaction that is always rolled back |
 | **Ask for writes** | Read, and propose writes that you allow once or decline in Tabula |
 | **Read & write** | Run anything — for throwaway databases |
 
@@ -187,6 +223,8 @@ The same dialog sets how the connection is secured:
 
 > [!NOTE]
 > Read-only is enforced by the database, not by parsing SQL, and a multi-statement escape like `SELECT 1; COMMIT; DELETE …` is rejected. On PostgreSQL, a read-only transaction still lets functions such as `pg_terminate_backend` run, so for production also give the connection a read-only database role. On SQLite, agents read through a connection opened read-only that can't attach other files, so `ATTACH` and `VACUUM INTO` are no way around it.
+>
+> MySQL refuses every data change in a read-only transaction, but DDL commits the transaction before it runs, so agents may only run statements that read (`SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `TABLE`, `VALUES`; no `INTO OUTFILE`); anything else asks for approval. SQL Server has no read-only transactions at all, so there Tabula itself checks the statement: one `SELECT` (or `WITH … SELECT`) with no `INTO`, `EXEC`, data change, `OPENROWSET` or sequence value, run in a transaction that is rolled back afterwards. That check is careful but it is Tabula's, not the server's: for production, give agents a login with only `db_datareader`.
 
 ## ⌨️ Shortcuts
 
@@ -211,6 +249,7 @@ On macOS, use <kbd>Cmd</kbd> instead of <kbd>Ctrl</kbd>.
 ```text
 tabula                                  open the app
 tabula --url postgres://…               open the app and connect
+tabula --url mysql://… | sqlserver://…  the same for MySQL (MariaDB) or SQL Server
 tabula --url sqlite:/path/to/file.db    the same for a SQLite file (or just its path)
 tabula --connect NAME                   open the app on a saved connection
 tabula add NAME URL [--ai MODE]         save a connection (off, read-only, ask, read-write)
@@ -281,15 +320,30 @@ sqlite3 shop.db < scripts/seed-sqlite.sql
 tabula --url sqlite:shop.db
 ```
 
+And on MySQL or SQL Server (the SQL Server script makes a `shop` database with a `shop` schema):
+
+```sh
+docker run -d --name tabula-mysql -e MYSQL_ROOT_PASSWORD=tabula -p 3306:3306 mysql:8.4
+docker exec -i tabula-mysql mysql -uroot -ptabula < scripts/seed-mysql.sql
+tabula --url mysql://root:tabula@127.0.0.1/shop
+
+docker run -d --name tabula-mssql -e ACCEPT_EULA=Y -e 'MSSQL_SA_PASSWORD=Tabula!Pass1' -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
+docker exec -i tabula-mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Tabula!Pass1' -C < scripts/seed-sqlserver.sql
+tabula --url 'sqlserver://sa:Tabula%21Pass1@127.0.0.1/shop'
+```
+
 ## 🧪 Testing
 
 ```sh
 docker run -d --name tabula-pg -e POSTGRES_PASSWORD=tabula -p 5432:5432 postgres:17
 docker exec -i tabula-pg psql -U postgres < scripts/seed.sql
 TABULA_TEST_URL=postgres://postgres:tabula@localhost/postgres cargo test
+# With the MySQL and SQL Server demo containers above:
+TABULA_TEST_MYSQL_URL=mysql://root:tabula@127.0.0.1/shop \
+TABULA_TEST_SQLSERVER_URL='sqlserver://sa:Tabula%21Pass1@127.0.0.1/shop' cargo test
 cargo run -- --screenshot shots --url postgres://postgres:tabula@localhost/postgres
 ```
 
 `cargo test -- --ignored copilot` asks a signed-in Copilot for its model list, and `TABULA_AI_DEBUG=1 tabula ask NAME "question" --copilot` prints every event the SDK sends.
 
-The PostgreSQL database and MCP tests skip without `TABULA_TEST_URL`; the SQLite ones build their own database from `scripts/seed-sqlite.sql` and always run. `TABULA_TEST_CONNECTION=name` runs the PostgreSQL database test on a saved connection instead, taking its password from the credential store. The screenshots above come from `--screenshot` against the two seed files; headless rendering needs macOS or Linux.
+The PostgreSQL database and MCP tests skip without `TABULA_TEST_URL`, and the MySQL and SQL Server ones without their URLs; the SQLite ones build their own database from `scripts/seed-sqlite.sql` and always run. `TABULA_TEST_CONNECTION=name` runs the PostgreSQL database test on a saved connection instead, taking its password from the credential store. The screenshots above come from `--screenshot` against the two seed files; headless rendering needs macOS or Linux.

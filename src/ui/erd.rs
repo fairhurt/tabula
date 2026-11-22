@@ -536,6 +536,7 @@ impl ErdTab {
             rows_estimate: t.rows_estimate,
             comment: None,
             signature: None,
+            engine: self.session.profile.engine,
         }
     }
 

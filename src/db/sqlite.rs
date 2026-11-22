@@ -136,6 +136,7 @@ impl Backend {
                         rows_estimate: estimates.get(&name).copied(),
                         comment: None,
                         signature: None,
+                        engine: crate::profiles::Engine::Sqlite,
                         name,
                     })
                     .collect())

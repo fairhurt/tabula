@@ -14,7 +14,7 @@ use super::{
     Change, ColumnInfo, ConstraintInfo, DbObject, EditTarget, ForeignKey, IndexInfo, MapColumn, MapTable,
     ObjectKind, QueryOutcome, ResultColumn, ResultSet, TableInfo, WriteRefused, quote_ident,
 };
-use crate::profiles::{Profile, SslMode};
+use crate::profiles::{Engine, Profile, SslMode};
 
 /// A database error with the server's detail, hint and position.
 fn describe_error(e: &tokio_postgres::Error) -> String {
@@ -177,6 +177,7 @@ impl Backend {
                 rows_estimate: r.get(2),
                 comment: r.get(3),
                 signature: None,
+                engine: Engine::Postgres,
             });
         }
         let funcs = self
@@ -199,6 +200,7 @@ impl Backend {
                 rows_estimate: None,
                 comment: r.get(2),
                 signature: Some(r.get(1)),
+                engine: Engine::Postgres,
             });
         }
         Ok(out)
